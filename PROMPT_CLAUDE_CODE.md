@@ -4,7 +4,7 @@ Eres el desarrollador de una app Android para la práctica final del Máster en 
 
 ## 1. Qué hay que construir
 
-Una app de chat cliente/servidor **sin internet**: un móvil crea una sala y hace de **servidor TCP** en la Wi‑Fi local; el resto se une como clientes. Implementamos **los dos extremos** con `java.net.ServerSocket`/`Socket`. **Prohibido** cualquier servicio o SDK de mensajería de terceros (Firebase, Nearby Connections, XMPP, Socket.IO…).
+Una app de chat cliente/servidor **sin internet** (las pruebas y la demo se hacen en mi Wi‑Fi doméstica): un móvil crea una sala y hace de **servidor TCP** en la Wi‑Fi local; el resto se une como clientes. Implementamos **los dos extremos** con `java.net.ServerSocket`/`Socket`. **Prohibido** cualquier servicio o SDK de mensajería de terceros (Firebase, Nearby Connections, XMPP, Socket.IO…).
 
 ### Requisitos mínimos (dan el aprobado; NUNCA se pueden romper)
 1. Un dispositivo hace de servidor y acepta la conexión de un cliente.
@@ -20,7 +20,8 @@ Una app de chat cliente/servidor **sin internet**: un móvil crea una sala y hac
 3. **Descubrimiento** — el cliente encuentra al servidor sin teclear la IP: NFC (rápido) y código de 4 caracteres (respaldo).
 4. **Cifrado** — cifrado propio de los mensajes (ECDH + AES‑GCM).
 5. **Imágenes** — envío de fotos además de texto.
-6. (Gratis con el diseño) **Interfaz cuidada** — globos, nombres, hora, estado de la conexión.
+6. **Propuesta propia: notas de voz** — grabar y enviar mensajes de audio (pendiente de acordar con el profesor).
+7. (Gratis con el diseño) **Interfaz cuidada** — globos, nombres, hora, estado de la conexión.
 
 ## 2. Arquitectura
 
@@ -42,8 +43,8 @@ com.redes.privati
 ## 3. Protocolo (definirlo antes de programar la red)
 
 - TCP con **tramas con longitud**: `[4 bytes longitud big-endian][1 byte tipo][cuerpo]`. Nada de `readLine()`: las imágenes son binarias. Longitud máxima de trama: 2 MB; si se supera, se cierra la conexión.
-- Tipos: `HELLO` (cliente → nombre, clave pública, código de sala), `WELCOME` (servidor → id asignado, lista de participantes, clave pública), `REJECT` (motivo: sala llena, código incorrecto, nombre repetido, expulsado), `TEXT`, `IMAGE`, `JOIN`/`LEAVE` (avisos de sistema), `PING`/`PONG`, `BYE`.
-- Cuerpos de control en JSON (`kotlinx.serialization`); el cuerpo de `IMAGE` es `cabecera JSON + bytes JPEG`.
+- Tipos: `HELLO` (cliente → nombre, clave pública, código de sala), `WELCOME` (servidor → id asignado, lista de participantes, clave pública), `REJECT` (motivo: sala llena, código incorrecto, nombre repetido, expulsado), `TEXT`, `IMAGE`, `AUDIO`, `JOIN`/`LEAVE` (avisos de sistema), `PING`/`PONG`, `BYE`.
+- Cuerpos de control en JSON (`kotlinx.serialization`); el cuerpo de `IMAGE` es `cabecera JSON + bytes JPEG` y el de `AUDIO` es `cabecera JSON (duración en ms) + bytes AAC/M4A`.
 - Cada mensaje lleva `id` (UUID), `senderId`, `senderName`, `timestamp`. El servidor reenvía a todos **menos al emisor** y el emisor pinta su mensaje en local en el momento.
 
 ## 4. Detalle de cada mejora
@@ -77,6 +78,16 @@ com.redes.privati
 - Antes de enviar: reescalar a 1280 px como máximo en el lado largo, JPEG calidad 80, en `Dispatchers.Default`.
 - Burbuja de imagen con miniatura (Coil desde `ByteArray`/archivo en caché) y tamaño en el metadato («212 KB · por red local»). Al tocarla, vista a pantalla completa.
 
+### Notas de voz (propuesta propia)
+- Grabación con `MediaRecorder` (salida `MPEG_4`, codificador `AAC`, mono, 64 kbps, 44,1 kHz) a un archivo temporal en `cacheDir`. Duración máxima 60 s (≈ 500 KB, cabe en una trama).
+- Permiso `RECORD_AUDIO` pedido en tiempo de ejecución la primera vez que se pulsa el micrófono, con explicación si se deniega.
+- Interacción tipo WhatsApp: **mantener pulsado** el botón de micrófono para grabar y soltar para enviar; deslizar a la izquierda para cancelar. Mientras se graba: punto rojo, contador «0:07» y texto «Desliza para cancelar».
+- El botón de micrófono sustituye al de enviar cuando el campo de texto está vacío.
+- Notas de menos de 1 s se descartan.
+- Envío como trama `AUDIO`, cifrada igual que el resto. El receptor guarda los bytes en caché.
+- Burbuja de audio: botón circular play/pausa, barra de progreso (o forma de onda simple calculada con `getMaxAmplitude()` durante la grabación y enviada en la cabecera como ~30 valores) y duración. Reproducción con `MediaPlayer`; solo suena una nota a la vez y se para al salir de la pantalla.
+- Liberar siempre `MediaRecorder`/`MediaPlayer` (`release()`) en `onStop`/`DisposableEffect`.
+
 ## 5. Diseño — sistema «Corro» (respetarlo tal cual)
 
 Tema propio en `ui/theme` que traduce estos tokens; no uses los colores por defecto de Material.
@@ -103,13 +114,21 @@ Avatares (fondo/iniciales, uno fijo por persona según hash del id): melocotón 
 
 **Forma y medidas:** radios 6 (cola de burbuja), 18 (burbuja), 28 (tarjetas), píldora completa en botones, campos, pestañas y avatares. Márgenes laterales 20 dp; entre burbujas 10 dp; CTA 56 dp de alto; campos 52; toque mínimo 44; avatares 52/46/30. Sombra del CTA: violeta suave (0 10 30, primary al 35 %).
 
-**Componentes a crear en Compose:** `CorroButton` (primario, secundario tonal, destructivo tonal, icono redondo), `CorroTextField`, `Avatar`, `MessageBubble` (entrante blanca con cola abajo‑izquierda; propia `bubble-out` con cola abajo‑derecha; hora dentro; doble check opcional), `StatusPill`, `ChatRow`.
+**Componentes a crear en Compose:** `CorroButton` (primario, secundario tonal, destructivo tonal, icono redondo), `CorroTextField`, `Avatar`, `MessageBubble` (entrante blanca con cola abajo‑izquierda; propia `bubble-out` con cola abajo‑derecha; hora dentro; doble check opcional; variantes texto, imagen y audio), `StatusPill`, `ChatRow`.
+
+**Reutilización de componentes (obligatorio):**
+- **Un archivo por componente** en `ui/components/`, con el mismo nombre que el composable: `CorroButton.kt`, `CorroTextField.kt`, `Avatar.kt`, `MessageBubble.kt`, `AudioBubble.kt`, `ImageBubble.kt`, `StatusPill.kt`, `ChatRow.kt`, `RoomCodeInput.kt`, `NfcWaves.kt`, `CorroTopBar.kt`, `MessageInputBar.kt`, `CorroLogo.kt`. Si un componente tiene variantes, van en el mismo archivo como parámetro (`enum class ButtonVariant { Primary, Secondary, Danger, Icon }`), no como copias.
+- Los iconos propios, en `ui/icons/CorroIcons.kt` (un `ImageVector` por icono).
+- Los componentes son **sin estado**: reciben datos y lambdas (`text`, `onClick`, `enabled`…) y un `modifier: Modifier = Modifier` como primer parámetro opcional. Nada de ViewModel ni lógica de red dentro.
+- Todo color, tipografía, radio, espaciado y tamaño sale del tema (`CorroTheme.colors`, `CorroTheme.typography`, `CorroShapes`, `CorroSpacing`, `CorroSizes` en `ui/theme/`). **Prohibido** escribir `Color(0xFF…)`, `dp` sueltos de diseño o `RoundedCornerShape(…)` dentro de una pantalla.
+- Las pantallas (`ui/screens/<Pantalla>/<Pantalla>Screen.kt`) **solo componen** componentes y layouts (`Column`, `Row`, `LazyColumn`…). Si en una pantalla necesitas un trozo de UI que se repite o que tiene estilo propio, sácalo a `ui/components/` antes de usarlo.
+- Cada componente lleva su `@Preview` en claro y en oscuro, y un KDoc en castellano con para qué sirve y qué significa cada parámetro.
 
 **Pantallas (subconjunto del prototipo):**
 1. **Bienvenida** — isotipo (círculo primary con bocadillo sonriente) + «Corro», ilustración de círculos concéntricos, campo de nombre, «Crear sala» (primario) y «Unirme» (secundario).
 2. **Unirse** — tarjeta NFC «Acerca tu móvil» con ondas animadas; debajo «o escribe el código» (4 casillas); enlace «Conectar por IP» que despliega IP + puerto validados.
 3. **Panel del host** — código grande, IP:puerto en mono, «NFC activado · esperando…», lista de personas con opción de expulsar, «Ir al chat» y «Cerrar sala» (destructivo).
-4. **Conversación** — cabecera con nombre de sala, «5 en la sala», `StatusPill` de conexión (En línea / Reconectando… / Desconectado) y candado de cifrado; hilo sobre surface-muted; barra inferior con botón de adjuntar imagen y campo de mensaje.
+4. **Conversación** — cabecera con nombre de sala, «5 en la sala», `StatusPill` de conexión (En línea / Reconectando… / Desconectado) y candado de cifrado; hilo sobre surface-muted; barra inferior con botón de adjuntar imagen, campo de mensaje y botón de micrófono/enviar (círculo primary).
 
 Iconos: trazo propio 24×24, sin relleno, trazo 2, extremos redondeados (como `ImageVector` o `Icons.Rounded` si se parece). Soporta modo oscuro.
 
@@ -117,15 +136,16 @@ Iconos: trazo propio 24×24, sin relleno, trazo 2, extremos redondeados (como `I
 
 Ve por fases. **Al final de cada fase**: `./gradlew assembleDebug` sin errores, lista de pruebas manuales en dos móviles reales, y un commit con mensaje en castellano. No empieces la siguiente fase hasta que yo confirme que la anterior funciona en los móviles.
 
-- **Fase 0** — Tema Corro + componentes + pantallas con datos falsos (previews de Compose).
+- **Fase 0** — Tema Corro (tokens) → componentes reutilizables, cada uno en su archivo y con previews → pantallas con datos falsos montadas solo con esos componentes.
 - **Fase 1** — Mínimos: servidor 1↔1 por IP manual, texto bidireccional, propios/ajenos, detección de desconexión. ⚠️ Esta fase debe quedar perfecta antes de seguir.
 - **Fase 2** — Sala de chat (N clientes, reenvío, avisos de sistema, lista de personas).
 - **Fase 3** — Robustez (validación, heartbeat, reconexión, rechazo y expulsión).
 - **Fase 4** — Descubrimiento por código con NSD.
 - **Fase 5** — Cifrado ECDH + AES‑GCM.
 - **Fase 6** — Imágenes.
-- **Fase 7** — NFC con HCE (lo último: es lo más frágil y depende del hardware).
+- **Fase 7** — Notas de voz.
+- **Fase 8** — NFC con HCE (lo último: es lo más frágil y depende del hardware).
 
-Reglas: permisos mínimos en el manifiesto (`INTERNET`, `ACCESS_NETWORK_STATE`, `ACCESS_WIFI_STATE`, `CHANGE_WIFI_MULTICAST_STATE`, `NFC` con `required="false"`); nada de red en el hilo principal; comentarios en castellano; si algo de esta especificación es inviable o hay una opción claramente mejor, **para y pregúntame** en vez de improvisar.
+Reglas: permisos mínimos en el manifiesto (`INTERNET`, `ACCESS_NETWORK_STATE`, `ACCESS_WIFI_STATE`, `CHANGE_WIFI_MULTICAST_STATE`, `RECORD_AUDIO`, `NFC` con `required="false"`); nada de red en el hilo principal; comentarios en castellano; si algo de esta especificación es inviable o hay una opción claramente mejor, **para y pregúntame** en vez de improvisar.
 
 Empieza leyendo el proyecto, propón el plan de la Fase 0 con la lista de archivos que vas a crear y espera mi OK.

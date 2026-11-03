@@ -1,34 +1,21 @@
 package com.redes.privati.ui.theme
 
 import androidx.compose.material3.Typography
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.sp
 
-// Set of Material typography styles to start with
-val Typography = Typography(
-    bodyLarge = TextStyle(
-        fontFamily = FontFamily.Default,
-        fontWeight = FontWeight.Normal,
-        fontSize = 16.sp,
-        lineHeight = 24.sp,
-        letterSpacing = 0.5.sp
-    )
-    /* Other default text styles to override
-    titleLarge = TextStyle(
-        fontFamily = FontFamily.Default,
-        fontWeight = FontWeight.Normal,
-        fontSize = 22.sp,
-        lineHeight = 28.sp,
-        letterSpacing = 0.sp
-    ),
-    labelSmall = TextStyle(
-        fontFamily = FontFamily.Default,
-        fontWeight = FontWeight.Medium,
-        fontSize = 11.sp,
-        lineHeight = 16.sp,
-        letterSpacing = 0.5.sp
-    )
-    */
+/**
+ * Tipografía de Material3 mapeada desde [PrivatiTypography].
+ * Se pasa a [MaterialTheme] dentro de [PrivatiTheme] para que los componentes
+ * de Material3 (TextField, Scaffold…) hereden los estilos de Privati.
+ */
+internal val PrivatiMaterialTypography = Typography(
+    displayLarge = PrivatiTypography.display,
+    titleLarge = PrivatiTypography.title1,
+    titleMedium = PrivatiTypography.title2,
+    headlineSmall = PrivatiTypography.heading,
+    bodyLarge = PrivatiTypography.bodyStrong,
+    bodyMedium = PrivatiTypography.body,
+    bodySmall = PrivatiTypography.bodySm,
+    labelLarge = PrivatiTypography.label,
+    labelMedium = PrivatiTypography.caption,
+    labelSmall = PrivatiTypography.micro,
 )
