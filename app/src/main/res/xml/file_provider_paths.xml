@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Fotos temporales capturadas con la cámara; se guardan en caché y se borran tras el envío -->
+    <cache-path name="fotos_temp" path="." />
+</paths>

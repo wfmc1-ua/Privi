@@ -34,13 +34,13 @@ import com.redes.privati.ui.theme.PrivatiTypography
  * Pantalla de bienvenida de Privati.
  * El usuario elige su nombre y decide si crea una sala (host) o se une a una existente.
  *
- * @param onCreateRoom Navegación hacia el panel del host.
- * @param onJoinRoom Navegación hacia la pantalla de unirse.
+ * @param onCreateRoom Navegación hacia el panel del host; recibe el nombre elegido.
+ * @param onJoinRoom Navegación hacia la pantalla de unirse; recibe el nombre elegido.
  */
 @Composable
 fun WelcomeScreen(
-    onCreateRoom: () -> Unit = {},
-    onJoinRoom: () -> Unit = {},
+    onCreateRoom: (name: String) -> Unit = {},
+    onJoinRoom: (name: String) -> Unit = {},
 ) {
     val colors = PrivatiTheme.colors
     var name by remember { mutableStateOf("") }
@@ -113,7 +113,7 @@ fun WelcomeScreen(
 
             PrivatiButton(
                 text = "Crear sala",
-                onClick = { if (validate()) onCreateRoom() },
+                onClick = { if (validate()) onCreateRoom(name.trim()) },
                 variant = ButtonVariant.Primary,
             )
 
@@ -121,7 +121,7 @@ fun WelcomeScreen(
 
             PrivatiButton(
                 text = "Unirme a una sala",
-                onClick = { if (validate()) onJoinRoom() },
+                onClick = { if (validate()) onJoinRoom(name.trim()) },
                 variant = ButtonVariant.Secondary,
             )
         }

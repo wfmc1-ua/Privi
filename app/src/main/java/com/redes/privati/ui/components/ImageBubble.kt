@@ -1,23 +1,26 @@
 package com.redes.privati.ui.components
 
 import android.content.res.Configuration
+import android.graphics.BitmapFactory
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -53,6 +56,16 @@ fun ImageBubble(
     val timeColor = if (isOwn) Color(0xFFE4E0FF) else colors.inkMuted
     val shape = if (isOwn) PrivatiShapes.bubbleOutgoing else PrivatiShapes.bubbleIncoming
 
+    // Decodificar ByteArray → ImageBitmap de forma perezosa; para otros tipos (URI, String)
+    // se delega en AsyncImage de Coil.
+    val imageBitmap = remember(imageModel) {
+        (imageModel as? ByteArray)?.let { bytes ->
+            try {
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+            } catch (_: Exception) { null }
+        }
+    }
+
     Row(
         modifier = modifier.fillMaxWidth(),
         horizontalArrangement = if (isOwn) Arrangement.End else Arrangement.Start,
@@ -65,29 +78,42 @@ fun ImageBubble(
                 .clickable(onClick = onTap),
         ) {
             Column {
-                if (imageModel != null) {
-                    AsyncImage(
-                        model = imageModel,
-                        contentDescription = "Imagen recibida",
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .size(200.dp),
-                    )
-                } else {
-                    // Placeholder mientras llega la imagen
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .size(200.dp)
-                            .background(colors.surfaceRaised),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            text = "Imagen",
-                            style = PrivatiTypography.caption,
-                            color = colors.inkMuted,
+                when {
+                    imageBitmap != null -> {
+                        Image(
+                            bitmap = imageBitmap,
+                            contentDescription = "Imagen recibida",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .size(200.dp),
                         )
+                    }
+                    imageModel != null -> {
+                        // URI o String: delegar en Coil
+                        AsyncImage(
+                            model = imageModel,
+                            contentDescription = "Imagen recibida",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .size(200.dp),
+                        )
+                    }
+                    else -> {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .size(200.dp)
+                                .background(colors.surfaceRaised),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                text = "Imagen",
+                                style = PrivatiTypography.caption,
+                                color = colors.inkMuted,
+                            )
+                        }
                     }
                 }
 

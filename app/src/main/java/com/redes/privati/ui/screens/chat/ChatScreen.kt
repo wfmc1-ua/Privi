@@ -1,12 +1,25 @@
 package com.redes.privati.ui.screens.chat
 
+import android.Manifest
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.BitmapFactory
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -15,16 +28,26 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import com.redes.privati.data.ConnectionStatus
-import com.redes.privati.data.Message
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.redes.privati.data.MessageType
 import com.redes.privati.ui.components.AudioBubble
 import com.redes.privati.ui.components.ImageBubble
@@ -42,38 +65,109 @@ import java.util.Locale
 
 /**
  * Pantalla de conversación activa.
- * Muestra el hilo de mensajes (texto, imagen, audio y avisos de sistema)
- * con la barra de entrada en la parte inferior.
+ * Muestra el hilo de mensajes real desde [ChatViewModel] con la barra de entrada.
  *
- * @param onBack Navegación de retroceso.
+ * @param viewModel ViewModel que provee mensajes, estado de sala y entrada de texto.
+ * @param onBack Navegación de retroceso; quien llame debe llamar a [ChatViewModel.desconectar] antes.
  */
 @Composable
 fun ChatScreen(
+    viewModel: ChatViewModel,
     onBack: () -> Unit = {},
 ) {
+    val context = LocalContext.current
     val colors = PrivatiTheme.colors
     val fmt = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
     val listState = rememberLazyListState()
-    var inputText by remember { mutableStateOf("") }
 
-    // Datos de prueba para la Fase 0
-    val messages = remember {
-        listOf(
-            Message(senderId = "c1", senderName = "Ana", text = "Hola, ¿me escuchas?", timestamp = System.currentTimeMillis() - 120_000, isOwn = false),
-            Message(senderId = "me", senderName = "Yo", text = "Sí, perfectamente. ¿Todos conectados?", timestamp = System.currentTimeMillis() - 110_000, isOwn = true),
-            Message(senderId = "c2", senderName = "Pedro", text = "Yo también estoy aquí.", timestamp = System.currentTimeMillis() - 100_000, isOwn = false),
-            Message(senderId = "", senderName = "", type = MessageType.SYSTEM, text = "María se ha unido", timestamp = System.currentTimeMillis() - 90_000, isOwn = false),
-            Message(senderId = "me", senderName = "Yo", type = MessageType.AUDIO, audioDurationMs = 7400, timestamp = System.currentTimeMillis() - 80_000, isOwn = true),
-            Message(senderId = "c1", senderName = "Ana", type = MessageType.IMAGE, imageSizeLabel = "212 KB · por red local", timestamp = System.currentTimeMillis() - 60_000, isOwn = false),
-            Message(senderId = "me", senderName = "Yo", text = "Genial, todo funciona.", timestamp = System.currentTimeMillis() - 30_000, isOwn = true),
-        )
+    val messages by viewModel.messages.collectAsState()
+    val roomState by viewModel.roomState.collectAsState()
+    val inputText by viewModel.inputText.collectAsState()
+
+    // Estado de grabación y reproducción de audio
+    val estaGrabando by viewModel.estaGrabando.collectAsState()
+    val duracionGrabacionMs by viewModel.duracionGrabacionMs.collectAsState()
+    val idMensajeReproduciendo by viewModel.idMensajeReproduciendo.collectAsState()
+    val progresoReproduccion by viewModel.progresoReproduccion.collectAsState()
+
+    // Duración formateada «0:07» que se muestra en el indicador de grabación
+    val duracionFormateada = remember(duracionGrabacionMs) {
+        val seg = (duracionGrabacionMs / 1000).toInt()
+        "%d:%02d".format(seg / 60, seg % 60)
+    }
+
+    // Launcher para solicitar el permiso RECORD_AUDIO la primera vez que se usa el micrófono.
+    // Si se concede, inicia la grabación de inmediato.
+    val permisoAudioLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { concedido ->
+        if (concedido) viewModel.iniciarGrabacion(context)
+    }
+
+    // Liberar grabación y reproducción al salir de la pantalla (spec: "se para al salir")
+    DisposableEffect(Unit) {
+        onDispose {
+            viewModel.cancelarGrabacion()
+            viewModel.detenerReproduccion()
+        }
+    }
+
+    // Launcher del selector de imágenes del sistema (sin permisos de almacenamiento)
+    val imageLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia(),
+    ) { uri ->
+        uri?.let { viewModel.enviarImagen(it) }
+    }
+
+    // Ruta absoluta del fichero temporal de la cámara.
+    // rememberSaveable sobrevive a la recreación de Activity (Android puede matar el
+    // proceso mientras la app de cámara está en primer plano y recrearlo al volver).
+    var tempFotoRuta by rememberSaveable { mutableStateOf("") }
+
+    // Contrato extendido que añade FLAG_GRANT_WRITE_URI_PERMISSION: sin este flag
+    // la app de cámara no puede escribir en la URI del FileProvider.
+    val contratoCamara = remember {
+        object : ActivityResultContracts.TakePicture() {
+            override fun createIntent(context: Context, input: Uri): Intent =
+                super.createIntent(context, input)
+                    .addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        }
+    }
+
+    // Launcher de la cámara: recibe true si el usuario capturó la foto, false si canceló.
+    // NO borramos el fichero aquí: enviarImagen() es asíncrono y el borrado debe ocurrir
+    // después de que la corrutina haya leído el bitmap (ver ChatRepository.enviarImagen).
+    val fotoLauncher = rememberLauncherForActivityResult(contratoCamara) { capturada ->
+        if (capturada && tempFotoRuta.isNotEmpty()) {
+            val archivo = java.io.File(tempFotoRuta)
+            if (archivo.exists() && archivo.length() > 0) {
+                viewModel.enviarImagen(Uri.fromFile(archivo))
+            }
+        }
+        tempFotoRuta = ""
+    }
+
+    // Bytes de la imagen seleccionada para la vista a pantalla completa; null = oculto
+    var imagenPantallaCompleta by remember { mutableStateOf<ByteArray?>(null) }
+
+    // Nombre del otro participante como título de la barra
+    val tituloChat = roomState.participants
+        .firstOrNull { it.id != roomState.localUserId }
+        ?.name
+        ?: "Chat"
+
+    // Auto-scroll al último mensaje cuando llega uno nuevo
+    LaunchedEffect(messages.size) {
+        if (messages.isNotEmpty()) {
+            listState.animateScrollToItem(messages.size - 1)
+        }
     }
 
     Scaffold(
         topBar = {
             PrivatiTopBar(
-                title = "Sala de prueba",
-                subtitle = "3 en la sala",
+                title = tituloChat,
+                subtitle = "${roomState.participants.size} en la sala",
                 onNavigateBack = onBack,
                 actions = {
                     Row(
@@ -81,12 +175,14 @@ fun ChatScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         modifier = Modifier.padding(end = 8.dp),
                     ) {
-                        StatusPill(status = ConnectionStatus.ONLINE)
-                        Icon(
-                            imageVector = PrivatiIcons.Lock,
-                            contentDescription = "Cifrado",
-                            tint = colors.success,
-                        )
+                        StatusPill(status = roomState.connectionStatus)
+                        if (roomState.isEncrypted) {
+                            Icon(
+                                imageVector = PrivatiIcons.Lock,
+                                contentDescription = "Cifrado activo",
+                                tint = colors.success,
+                            )
+                        }
                     }
                 },
             )
@@ -94,61 +190,152 @@ fun ChatScreen(
         bottomBar = {
             MessageInputBar(
                 text = inputText,
-                onTextChange = { inputText = it },
-                onSend = { inputText = "" },
+                onTextChange = viewModel::onInputChange,
+                onSend = { viewModel.enviarMensaje() },
+                onAttachImage = {
+                    imageLauncher.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                    )
+                },
+                onTakePhoto = {
+                    try {
+                        val archivo = java.io.File.createTempFile(
+                            "corro_foto_", ".jpg", context.cacheDir,
+                        )
+                        tempFotoRuta = archivo.absolutePath
+                        val uri = FileProvider.getUriForFile(
+                            context, "${context.packageName}.fileprovider", archivo,
+                        )
+                        fotoLauncher.launch(uri)
+                    } catch (_: Exception) {
+                        tempFotoRuta = ""
+                    }
+                },
+                onMicPress = {
+                    val tienePermiso = ContextCompat.checkSelfPermission(
+                        context, Manifest.permission.RECORD_AUDIO
+                    ) == PackageManager.PERMISSION_GRANTED
+                    if (tienePermiso) {
+                        viewModel.iniciarGrabacion(context)
+                    } else {
+                        permisoAudioLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                },
+                onMicRelease = { viewModel.detenerGrabacion() },
+                onMicCancel = { viewModel.cancelarGrabacion() },
+                isRecording = estaGrabando,
+                recordingDuration = duracionFormateada,
             )
         },
         containerColor = colors.surfaceMuted,
     ) { innerPadding ->
-        LazyColumn(
-            state = listState,
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding),
-            contentPadding = PaddingValues(
-                horizontal = PrivatiSpacing.screenHorizontal,
-                vertical = PrivatiSpacing.md,
-            ),
-            verticalArrangement = Arrangement.spacedBy(PrivatiSpacing.bubbleGap),
-        ) {
-            items(messages, key = { it.id }) { msg ->
-                when (msg.type) {
-                    MessageType.SYSTEM -> {
-                        // Aviso de sistema centrado
-                        Column(
-                            modifier = Modifier.fillParentMaxWidth(),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                        ) {
-                            Text(
+        if (messages.isEmpty()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                Text(
+                    text = "Sé el primero en escribir algo",
+                    style = PrivatiTypography.body,
+                    color = colors.inkMuted,
+                )
+            }
+        } else {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+                contentPadding = PaddingValues(
+                    horizontal = PrivatiSpacing.screenHorizontal,
+                    vertical = PrivatiSpacing.md,
+                ),
+                verticalArrangement = Arrangement.spacedBy(PrivatiSpacing.bubbleGap),
+            ) {
+                items(messages, key = { it.id }) { msg ->
+                    when (msg.type) {
+                        MessageType.SYSTEM -> {
+                            Column(
+                                modifier = Modifier.fillParentMaxWidth(),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                            ) {
+                                Text(
+                                    text = msg.text,
+                                    style = PrivatiTypography.caption,
+                                    color = colors.inkMuted,
+                                )
+                            }
+                        }
+                        MessageType.TEXT -> {
+                            MessageBubble(
                                 text = msg.text,
-                                style = PrivatiTypography.caption,
-                                color = colors.inkMuted,
+                                time = fmt.format(Date(msg.timestamp)),
+                                isOwn = msg.isOwn,
+                                senderName = if (!msg.isOwn) msg.senderName else null,
+                                senderAvatarId = if (!msg.isOwn) msg.senderId else null,
+                            )
+                        }
+                        MessageType.IMAGE -> {
+                            ImageBubble(
+                                isOwn = msg.isOwn,
+                                imageModel = msg.imageBytes,
+                                sizeLabel = msg.imageSizeLabel,
+                                time = fmt.format(Date(msg.timestamp)),
+                                onTap = { imagenPantallaCompleta = msg.imageBytes },
+                            )
+                        }
+                        MessageType.AUDIO -> {
+                            val estaReproduciendo = idMensajeReproduciendo == msg.id
+                            AudioBubble(
+                                isOwn = msg.isOwn,
+                                isPlaying = estaReproduciendo,
+                                onPlayPause = {
+                                    msg.audioBytes?.let { bytes ->
+                                        viewModel.toggleReproduccion(msg.id, bytes)
+                                    }
+                                },
+                                durationMs = msg.audioDurationMs,
+                                progressFraction = if (estaReproduciendo) progresoReproduccion else 0f,
+                                waveform = msg.audioWaveform,
+                                time = fmt.format(Date(msg.timestamp)),
                             )
                         }
                     }
-                    MessageType.TEXT -> {
-                        MessageBubble(
-                            text = msg.text,
-                            time = fmt.format(Date(msg.timestamp)),
-                            isOwn = msg.isOwn,
-                            senderName = if (!msg.isOwn) msg.senderName else null,
-                            senderAvatarId = if (!msg.isOwn) msg.senderId else null,
-                        )
-                    }
-                    MessageType.IMAGE -> {
-                        ImageBubble(
-                            isOwn = msg.isOwn,
-                            sizeLabel = msg.imageSizeLabel,
-                            time = fmt.format(Date(msg.timestamp)),
-                        )
-                    }
-                    MessageType.AUDIO -> {
-                        AudioBubble(
-                            isOwn = msg.isOwn,
-                            durationMs = msg.audioDurationMs,
-                            time = fmt.format(Date(msg.timestamp)),
-                        )
-                    }
+                }
+            }
+        }
+    }
+
+    // Visor de imagen a pantalla completa: se abre al pulsar cualquier burbuja de imagen
+    imagenPantallaCompleta?.let { bytes ->
+        Dialog(
+            onDismissRequest = { imagenPantallaCompleta = null },
+            properties = DialogProperties(
+                usePlatformDefaultWidth = false,
+                dismissOnBackPress = true,
+                dismissOnClickOutside = true,
+            ),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black)
+                    .clickable { imagenPantallaCompleta = null },
+                contentAlignment = Alignment.Center,
+            ) {
+                val bitmap = remember(bytes) {
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                }
+                if (bitmap != null) {
+                    Image(
+                        bitmap = bitmap,
+                        contentDescription = "Imagen a pantalla completa",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize(),
+                    )
                 }
             }
         }
@@ -160,6 +347,12 @@ fun ChatScreen(
 @Composable
 private fun ChatScreenPreview() {
     PrivatiTheme {
-        ChatScreen()
+        Column(
+            modifier = Modifier.fillMaxSize(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Text("Vista previa: ChatScreen", style = PrivatiTypography.heading)
+        }
     }
 }

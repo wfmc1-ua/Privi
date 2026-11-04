@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Declaración del servicio HCE de Corro.
+    El AID F0434F52524F31 = F0 + "CORRO1" en ASCII; el prefijo F0 pertenece
+    al rango propietario libre según ISO 7816-5.
+    android:category="other" indica que no es de pago ni de fidelización.
+    android:requireDeviceScreenOn="true" evita respuestas mientras la pantalla está apagada.
+-->
+<host-apdu-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/app_name"
+    android:requireDeviceScreenOn="true">
+
+    <aid-group android:category="other">
+        <aid-filter android:name="F0434F52524F31" />
+    </aid-group>
+
+</host-apdu-service>

@@ -20,6 +20,8 @@ import androidx.compose.material.icons.rounded.WifiOff
 import androidx.compose.material.icons.rounded.PersonRemove
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.PhotoCamera
+import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.Refresh
 
 /**
@@ -48,4 +50,6 @@ object PrivatiIcons {
     val Add = Icons.Rounded.Add
     val Copy = Icons.Rounded.ContentCopy
     val Reconnect = Icons.Rounded.Refresh
+    val Camera = Icons.Rounded.PhotoCamera
+    val Gallery = Icons.Rounded.PhotoLibrary
 }

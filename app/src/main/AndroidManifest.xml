@@ -8,7 +8,13 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.NFC" />
+    <!-- android.hardware.camera no necesita el permiso CAMERA cuando se usa
+         ActivityResultContracts.TakePicture; la app del sistema gestiona la captura. -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.nfc" android:required="false" />
+    <!-- HCE requiere la extensión de hardware nfc.hce; required=false porque la app
+         funciona sin NFC usando el código de sala NSD como alternativa. -->
+    <uses-feature android:name="android.hardware.nfc.hce" android:required="false" />
 
     <application
         android:name=".PrivatiApplication"
@@ -31,6 +37,32 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Servicio HCE que responde al AID F0434F52524F31 mientras el host panel está abierto.
+             El sistema Android arranca y para el servicio automáticamente al detectar el lector NFC;
+             la app controla qué respuesta enviar a través de CorroHceService.salaActiva. -->
+        <service
+            android:name=".discovery.nfc.CorroHceService"
+            android:exported="true"
+            android:permission="android.permission.BIND_NFC_SERVICE">
+            <intent-filter>
+                <action android:name="android.nfc.cardemulation.action.HOST_APDU_SERVICE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.nfc.cardemulation.host_apdu_service"
+                android:resource="@xml/apduservice" />
+        </service>
+
+        <!-- FileProvider para URIs de fotos capturadas con la cámara (Fase 6) -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_provider_paths" />
+        </provider>
     </application>
 
 </manifest>

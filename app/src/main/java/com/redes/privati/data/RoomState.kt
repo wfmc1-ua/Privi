@@ -18,6 +18,7 @@ enum class ConnectionStatus {
  * @param connectionStatus Estado de la conexión del cliente o del servidor.
  */
 data class RoomState(
+    val localUserId: String = "",
     val roomCode: String = "",
     val hostIp: String = "",
     val port: Int = 0,

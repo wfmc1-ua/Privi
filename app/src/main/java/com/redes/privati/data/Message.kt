@@ -46,12 +46,13 @@ data class Message(
     val text: String = "",
     val imageBytes: ByteArray? = null,
     val imageSizeLabel: String? = null,
+    val audioBytes: ByteArray? = null,
     val audioDurationMs: Long = 0L,
     val audioWaveform: List<Float> = emptyList(),
     val timestamp: Long = System.currentTimeMillis(),
     val isOwn: Boolean = false,
 ) {
-    // ByteArray rompe equals/hashCode automáticos; se excluye de la comparación.
+    // ByteArrays rompen equals/hashCode automáticos; se excluyen de la comparación.
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is Message) return false
