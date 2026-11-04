@@ -42,7 +42,16 @@ enum class FrameType(val id: Byte) {
     PONG(10),
 
     /** Ambos → ambos: cierre ordenado de la sesión. */
-    BYE(11);
+    BYE(11),
+
+    /** Cliente → host: solicitud de creación de grupo con nombre y lista de miembros. */
+    CHAT_CREATE(12),
+
+    /** Host → miembros: confirmación del grupo creado con chatId, nombre y miembros. */
+    CHAT_INFO(13),
+
+    /** Host → cliente: solicitud de entrada recibida; el host debe aprobarla antes de WELCOME. */
+    PENDING(14);
 
     companion object {
         private val porId = values().associateBy { it.id }
@@ -83,6 +92,10 @@ data class HelloBody(
     val senderName: String,
     val roomCode: String = "",
     val publicKey: String = "",
+    /** "nfc" | "code" | "ip" según cómo el cliente inició la conexión. */
+    val joinMethod: String = "ip",
+    /** Solo se envía cuando joinMethod="nfc"; permite al host validar la autenticidad. */
+    val roomSecret: String = "",
 )
 
 /**
@@ -94,6 +107,8 @@ data class ParticipantInfo(
     val id: String,
     val name: String,
     val isHost: Boolean = false,
+    val joinMethod: String = "",
+    val joinedAt: Long = 0L,
 )
 
 /**
@@ -114,6 +129,10 @@ data class WelcomeBody(
     val hostName: String,
     val participants: List<ParticipantInfo> = emptyList(),
     val publicKey: String = "",
+    /** Grupos a los que pertenece el participante; enviados en el WELCOME al reconectar. */
+    val grupos: List<ChatInfoBody> = emptyList(),
+    /** Nombre visible de la sala; default "Sala de <host>", renombrable por el host. */
+    val roomName: String = "",
 )
 
 /**
@@ -149,6 +168,10 @@ data class TextBody(
 data class JoinLeaveBody(
     val participantId: String,
     val participantName: String,
+    /** Método con que el participante entró: "nfc" | "code" | "ip". Vacío en LEAVE. */
+    val joinMethod: String = "",
+    /** Marca de tiempo de entrada (ms desde epoch); 0 en LEAVE. */
+    val joinedAt: Long = 0L,
 )
 
 /**
@@ -174,6 +197,37 @@ data class ImageBody(
     val timestamp: Long,
     val sizeBytes: Int,
     val chatId: String = "sala",
+)
+
+/**
+ * Cuerpo de CHAT_CREATE: petición de creación de grupo enviada por un cliente al host.
+ *
+ * @param name     Nombre visible del grupo.
+ * @param memberIds UUIDs de los miembros deseados sin incluir al creador; el host lo añade.
+ */
+@Serializable
+data class ChatCreateBody(
+    val name: String,
+    val memberIds: List<String>,
+)
+
+/**
+ * Cuerpo de CHAT_INFO: descripción de un grupo enviada por el host a sus miembros.
+ * También se incluye en [WelcomeBody.grupos] al reconectar para restaurar grupos del cliente.
+ *
+ * @param chatId      Identificador del grupo ("grp:<uuid>").
+ * @param name        Nombre visible del grupo.
+ * @param memberIds   UUIDs de todos los miembros.
+ * @param creatorId   UUID del creador; vacío si viene de WELCOME al reconectar.
+ * @param creatorName Nombre del creador para el mensaje de sistema «X creó el grupo».
+ */
+@Serializable
+data class ChatInfoBody(
+    val chatId: String,
+    val name: String,
+    val memberIds: List<String>,
+    val creatorId: String = "",
+    val creatorName: String = "",
 )
 
 /**

@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -93,7 +94,8 @@ fun MessageInputBar(
         modifier = modifier
             .fillMaxWidth()
             .background(colors.surface)
-            .imePadding(),
+            .navigationBarsPadding()  // reserva el hueco de la barra de navegación del sistema
+            .imePadding(),            // sube sobre el teclado si está visible
     ) {
         HorizontalDivider(color = colors.divider, thickness = 1.dp)
 

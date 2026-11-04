@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.redes.privati.data.ChatRepository
+import com.redes.privati.data.PendingRequestInfo
 import com.redes.privati.data.RoomState
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -29,6 +30,12 @@ class HostViewModel(
         initialValue = repository.roomState.value,
     )
 
+    val pendingRequests: StateFlow<List<PendingRequestInfo>> = repository.pendingRequests.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = emptyList(),
+    )
+
     init {
         repository.establecerUsuarioLocal(nombre, esHost = true)
         repository.iniciarServidor()
@@ -45,6 +52,21 @@ class HostViewModel(
      */
     fun expulsarParticipante(participantId: String) {
         repository.expulsarParticipante(participantId)
+    }
+
+    /** Acepta la solicitud de entrada del cliente identificado por [remoteId]. */
+    fun aceptarSolicitud(remoteId: String) {
+        repository.aceptarSolicitud(remoteId)
+    }
+
+    /** Rechaza la solicitud de entrada del cliente identificado por [remoteId]. */
+    fun rechazarSolicitud(remoteId: String) {
+        repository.rechazarSolicitud(remoteId)
+    }
+
+    /** Renombra la sala y lo notifica a todos los clientes. */
+    fun renombrarSala(nuevoNombre: String) {
+        repository.renombrarSala(nuevoNombre)
     }
 
     override fun onCleared() {

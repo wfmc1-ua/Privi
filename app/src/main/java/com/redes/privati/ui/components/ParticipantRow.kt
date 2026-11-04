@@ -1,6 +1,7 @@
 package com.redes.privati.ui.components
 
 import android.content.res.Configuration
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -24,7 +25,7 @@ import com.redes.privati.ui.theme.PrivatiTheme
 import com.redes.privati.ui.theme.PrivatiTypography
 
 /**
- * Fila de participante para el panel del host.
+ * Fila de participante para el panel del host y la pestaña de Contactos.
  * Muestra el avatar, el nombre y, opcionalmente, un botón de expulsión.
  *
  * @param modifier Modificador externo.
@@ -32,6 +33,8 @@ import com.redes.privati.ui.theme.PrivatiTypography
  * @param isCurrentUser Si este participante es el dispositivo actual.
  * @param canKick Si el host puede expulsar a este participante (falso para el propio host).
  * @param onKick Callback al pulsar el botón de expulsión.
+ * @param onClick Callback al tocar la fila; null para filas no navegables.
+ * @param subtitle Texto secundario opcional bajo el nombre (p. ej. «Entró por NFC · ahora»).
  * @param showDivider Si se muestra un separador debajo de la fila.
  */
 @Composable
@@ -41,11 +44,17 @@ fun ParticipantRow(
     isCurrentUser: Boolean = false,
     canKick: Boolean = false,
     onKick: () -> Unit = {},
+    onClick: (() -> Unit)? = null,
+    subtitle: String? = null,
     showDivider: Boolean = true,
 ) {
     val colors = PrivatiTheme.colors
 
-    Column(modifier = modifier.fillMaxWidth()) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .run { if (onClick != null) clickable(onClick = onClick) else this },
+    ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -86,6 +95,13 @@ fun ParticipantRow(
                             color = colors.inkMuted,
                         )
                     }
+                }
+                if (subtitle != null) {
+                    Text(
+                        text = subtitle,
+                        style = PrivatiTypography.caption,
+                        color = colors.inkMuted,
+                    )
                 }
             }
 

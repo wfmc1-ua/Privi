@@ -6,8 +6,10 @@ import androidx.lifecycle.viewModelScope
 import com.redes.privati.data.ChatRepository
 import com.redes.privati.data.ChatSummary
 import com.redes.privati.data.RoomState
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 
 /**
@@ -60,6 +62,43 @@ class ChatsViewModel(
     /** Elimina el historial local del chat [chatId]. Sin efecto sobre «sala». */
     fun eliminar(chatId: String) {
         repository.eliminarChatLocal(chatId)
+    }
+
+    /** chatId del grupo recién creado; la UI lo usa para navegar automáticamente. */
+    val nuevoChatId: SharedFlow<String> = repository.nuevoChatId
+
+    /** Número de solicitudes de entrada pendientes (solo host); usado para la insignia de la campana. */
+    val pendingRequestCount: StateFlow<Int> = repository.pendingRequests
+        .map { it.size }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000),
+            initialValue = 0,
+        )
+
+    /**
+     * Crea un grupo con [nombre] y [memberIds] como miembros adicionales.
+     * Delega al repositorio según el modo (host o cliente).
+     */
+    fun crearGrupo(nombre: String, memberIds: List<String>) {
+        repository.crearGrupo(nombre, memberIds)
+    }
+
+    /**
+     * Calcula el chatId del privado con [contactId] (ids ordenados alfabéticamente
+     * para que los dos extremos lleguen al mismo chatId sin coordinación) y
+     * pre-registra el resumen en el repositorio para que el nombre sea visible
+     * en la cabecera antes de que se envíe el primer mensaje.
+     *
+     * @param contactId UUID del participante destino.
+     * @return chatId con formato "dm:<idMenor>:<idMayor>".
+     */
+    fun dmChatId(contactId: String): String {
+        val localId = roomState.value.localUserId
+        val partes = listOf(localId, contactId).sorted()
+        val chatId = "dm:${partes[0]}:${partes[1]}"
+        repository.asegurarChat(chatId)
+        return chatId
     }
 
     /** Cierra la sesión de chat y limpia el repositorio. */

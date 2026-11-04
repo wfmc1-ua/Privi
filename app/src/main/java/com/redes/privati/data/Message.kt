@@ -21,6 +21,8 @@ data class Participant(
     val id: String = UUID.randomUUID().toString(),
     val name: String,
     val isHost: Boolean = false,
+    val joinMethod: String = "",
+    val joinedAt: Long = 0L,
 )
 
 /**

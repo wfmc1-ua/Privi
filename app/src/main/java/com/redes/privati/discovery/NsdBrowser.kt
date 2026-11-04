@@ -4,13 +4,18 @@ import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.util.Log
+import com.redes.privati.data.SalaDescubierta
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
-import java.net.Inet4Address
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
@@ -39,21 +44,128 @@ class NsdBrowser(context: Context) {
     companion object {
         private const val TAG = "NsdBrowser"
 
-        /** Intentos máximos de resolución por servicio encontrado. */
         private const val MAX_INTENTOS_RESOLVE = 3
-
-        /** Tiempo de espera entre reintentos de resolución, en ms. */
         private const val RETRASO_RESOLVE_MS = 1_000L
     }
 
     private val nsdManager: NsdManager =
         context.getSystemService(Context.NSD_SERVICE) as NsdManager
 
-    /**
-     * Ámbito propio para lanzar los retardos de reintento de resolución.
-     * Vive mientras exista el NsdBrowser (ámbito de aplicación).
-     */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    // ── Descubrimiento continuo de salas (Fase 14) ───────────────────────────
+
+    private val _salas = MutableStateFlow<List<SalaDescubierta>>(emptyList())
+    val salas: StateFlow<List<SalaDescubierta>> = _salas.asStateFlow()
+
+    @Volatile private var continuousListener: NsdManager.DiscoveryListener? = null
+    private val resolviendoContinuo = AtomicBoolean(false)
+    private val colaResolucion = ConcurrentLinkedQueue<NsdServiceInfo>()
+
+    /**
+     * Inicia el descubrimiento continuo de salas Corro en la red.
+     * Las salas encontradas se acumulan en [salas] y se eliminan cuando desaparecen.
+     * Idempotente: llamar cuando ya está activo no hace nada.
+     */
+    fun iniciarDescubrimiento() {
+        if (continuousListener != null) return
+        _salas.value = emptyList()
+
+        continuousListener = object : NsdManager.DiscoveryListener {
+            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                Log.w(TAG, "Descubrimiento continuo fallido: $errorCode")
+                continuousListener = null
+            }
+            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {}
+            override fun onDiscoveryStarted(serviceType: String) {
+                Log.d(TAG, "Descubrimiento continuo iniciado")
+            }
+            override fun onDiscoveryStopped(serviceType: String) {
+                Log.d(TAG, "Descubrimiento continuo detenido")
+                continuousListener = null
+            }
+
+            override fun onServiceFound(serviceInfo: NsdServiceInfo) {
+                val prefix = NsdAdvertiser.PREFIJO_NOMBRE.uppercase()
+                if (!serviceInfo.serviceName.uppercase().startsWith(prefix)) return
+                colaResolucion.add(serviceInfo)
+                procesarColaResolucion()
+            }
+
+            override fun onServiceLost(serviceInfo: NsdServiceInfo) {
+                val code = extraerCodigo(serviceInfo.serviceName) ?: return
+                _salas.update { it.filter { s -> s.code != code } }
+            }
+        }
+
+        try {
+            nsdManager.discoverServices(
+                NsdAdvertiser.TIPO_SERVICIO,
+                NsdManager.PROTOCOL_DNS_SD,
+                continuousListener!!,
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "discoverServices (continuo) falló: ${e.message}")
+            continuousListener = null
+        }
+    }
+
+    /** Detiene el descubrimiento continuo y vacía la lista de salas. */
+    fun detenerDescubrimiento() {
+        val listener = continuousListener ?: return
+        continuousListener = null
+        scope.launch {
+            try { nsdManager.stopServiceDiscovery(listener) } catch (_: Exception) {}
+        }
+        _salas.value = emptyList()
+        colaResolucion.clear()
+    }
+
+    private fun procesarColaResolucion() {
+        if (!resolviendoContinuo.compareAndSet(false, true)) return
+        val serviceInfo = colaResolucion.poll() ?: run {
+            resolviendoContinuo.set(false)
+            return
+        }
+
+        try {
+            nsdManager.resolveService(serviceInfo, object : NsdManager.ResolveListener {
+                override fun onResolveFailed(si: NsdServiceInfo, errorCode: Int) {
+                    Log.w(TAG, "Resolución continua fallida (${si.serviceName}): $errorCode")
+                    resolviendoContinuo.set(false)
+                    if (colaResolucion.isNotEmpty()) scope.launch {
+                        delay(RETRASO_RESOLVE_MS)
+                        procesarColaResolucion()
+                    }
+                }
+
+                override fun onServiceResolved(si: NsdServiceInfo) {
+                    val code = extraerCodigo(si.serviceName)
+                    val ip = extraerIpUsable(si.host?.hostAddress)
+                    if (code != null && ip != null) {
+                        @Suppress("UNCHECKED_CAST")
+                        val attrs = try { si.attributes as? Map<String, ByteArray> ?: emptyMap() } catch (_: Exception) { emptyMap() }
+                        val name = attrs["name"]?.decodeToString()?.ifBlank { null } ?: code
+                        val hostName = attrs["host"]?.decodeToString()?.ifBlank { null } ?: ""
+                        val n = attrs["n"]?.decodeToString()?.toIntOrNull() ?: 1
+                        val sala = SalaDescubierta(code, name, hostName, n, ip, si.port)
+                        _salas.update { existing -> existing.filter { it.code != code } + sala }
+                    }
+                    resolviendoContinuo.set(false)
+                    if (colaResolucion.isNotEmpty()) procesarColaResolucion()
+                }
+            })
+        } catch (e: Exception) {
+            Log.e(TAG, "resolveService (continuo) lanzó excepción: ${e.message}")
+            resolviendoContinuo.set(false)
+        }
+    }
+
+    private fun extraerCodigo(serviceName: String): String? {
+        val prefix = NsdAdvertiser.PREFIJO_NOMBRE
+        if (!serviceName.uppercase().startsWith(prefix.uppercase())) return null
+        return serviceName.substring(prefix.length).substringBefore(' ').uppercase().takeIf { it.length == 4 }
+    }
 
     /**
      * Busca la sala con el [codigoSala] dado y devuelve `(ip, puerto)` al encontrarla.

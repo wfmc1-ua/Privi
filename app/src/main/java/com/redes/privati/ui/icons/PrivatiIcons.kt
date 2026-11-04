@@ -31,6 +31,7 @@ import androidx.compose.material.icons.rounded.PushPin
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.VolumeOff
 
 /**
@@ -70,4 +71,5 @@ object PrivatiIcons {
     val Delete = Icons.Rounded.Delete
     val Pin = Icons.Rounded.PushPin
     val MoreVert = Icons.Rounded.MoreVert
+    val Edit = Icons.Rounded.Edit
 }

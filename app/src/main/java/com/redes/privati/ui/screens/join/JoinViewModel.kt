@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.redes.privati.data.ChatRepository
 import com.redes.privati.data.ConnectionStatus
 import com.redes.privati.data.RoomState
+import com.redes.privati.data.SalaDescubierta
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -36,6 +37,19 @@ class JoinViewModel(
 
     /** Errores de conexión de un solo disparo (mostrar Snackbar en la UI). */
     val error: SharedFlow<String> = repository.error
+
+    /** Salas Corro descubiertas en la red local mediante NSD (Fase 14). */
+    val salas: StateFlow<List<SalaDescubierta>> = repository.salasDescubiertas.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = emptyList(),
+    )
+
+    /** Inicia el descubrimiento continuo de salas (llamar al entrar a la pantalla). */
+    fun iniciarDescubrimiento() = repository.iniciarDescubrimiento()
+
+    /** Detiene el descubrimiento (llamar al salir de la pantalla). */
+    fun detenerDescubrimiento() = repository.detenerDescubrimiento()
 
     /** Indica si hay un intento de conexión en curso (manual por IP). */
     val conectando: MutableStateFlow<Boolean> = MutableStateFlow(false)
@@ -119,21 +133,42 @@ class JoinViewModel(
     }
 
     /**
-     * Conecta directamente con los datos recibidos por NFC (ip, puerto y código de sala).
-     * El código se reenvía a [ChatRepository.conectarComoCliente] para usarlo como salt
-     * HKDF en el handshake ECDH, igual que en la conexión por código NSD.
+     * Conecta directamente con los datos recibidos por NFC.
+     * Pasa [joinMethod]="nfc" y el [secreto] para que el host auto-acepte sin mostrar PENDING.
      */
-    fun conectarViaNfc(ip: String, puerto: Int, codigo: String) {
+    fun conectarViaNfc(ip: String, puerto: Int, codigo: String, secreto: String = "") {
         if (conectando.value || buscandoPorCodigo.value) return
         viewModelScope.launch {
             conectando.value = true
             try {
-                repository.conectarComoCliente(ip, puerto, roomCode = codigo)
+                repository.conectarComoCliente(ip, puerto, roomCode = codigo, joinMethod = "nfc", roomSecret = secreto)
                 roomState.first { it.connectionStatus != ConnectionStatus.RECONNECTING }
             } finally {
                 conectando.value = false
             }
         }
+    }
+
+    /**
+     * Conecta directamente a una sala descubierta por NSD (modo "code" ya que el
+     * código está disponible; la IP se usa directamente sin nuevo NSD lookup).
+     */
+    fun conectarSalaDescubierta(sala: SalaDescubierta) {
+        if (conectando.value || buscandoPorCodigo.value) return
+        viewModelScope.launch {
+            conectando.value = true
+            try {
+                repository.conectarComoCliente(sala.ip, sala.port, roomCode = sala.code, joinMethod = "code")
+                roomState.first { it.connectionStatus != ConnectionStatus.RECONNECTING }
+            } finally {
+                conectando.value = false
+            }
+        }
+    }
+
+    /** Cancela una solicitud de entrada pendiente de aprobación. */
+    fun cancelarEspera() {
+        repository.cancelarEspera()
     }
 
     // ──────────────────────────────────────────────────────────────────────────

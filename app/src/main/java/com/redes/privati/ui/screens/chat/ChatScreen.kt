@@ -18,8 +18,10 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -205,7 +207,94 @@ fun ChatScreen(
                 },
             )
         },
-        bottomBar = {
+        // MessageInputBar ya NO va en bottomBar: se pone en el Column del contenido
+        // para que imePadding() en el Column lo suba correctamente sobre el teclado.
+        containerColor = colors.surfaceMuted,
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .consumeWindowInsets(innerPadding)  // marca los insets del Scaffold como consumidos
+                .imePadding(),                       // encoge el Column cuando aparece el teclado
+        ) {
+            // ── Lista de mensajes (ocupa todo el espacio libre) ──────────────
+            if (messages.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "Sé el primero en escribir algo",
+                        style = PrivatiTypography.body,
+                        color = colors.inkMuted,
+                    )
+                }
+            } else {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(
+                        horizontal = PrivatiSpacing.screenHorizontal,
+                        vertical = PrivatiSpacing.md,
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(PrivatiSpacing.bubbleGap),
+                ) {
+                    itemsIndexed(messages, key = { _, msg -> msg.id }) { index, msg ->
+                        // Separador de día: mostrar si es el primer mensaje o cambió el día
+                        val msgAnterior = if (index > 0) messages[index - 1] else null
+                        val cambiodia = msgAnterior == null
+                            || formatearDia(msgAnterior.timestamp) != formatearDia(msg.timestamp)
+                        if (cambiodia) {
+                            DaySeparator(timestamp = msg.timestamp)
+                        }
+
+                        when (msg.type) {
+                            MessageType.SYSTEM -> {
+                                SystemMessage(text = msg.text)
+                            }
+                            MessageType.TEXT -> {
+                                MessageBubble(
+                                    text = msg.text,
+                                    time = fmt.format(Date(msg.timestamp)),
+                                    isOwn = msg.isOwn,
+                                    senderName = if (!msg.isOwn) msg.senderName else null,
+                                    senderAvatarId = if (!msg.isOwn) msg.senderId else null,
+                                )
+                            }
+                            MessageType.IMAGE -> {
+                                ImageBubble(
+                                    isOwn = msg.isOwn,
+                                    imageModel = msg.imageBytes,
+                                    sizeLabel = msg.imageSizeLabel,
+                                    time = fmt.format(Date(msg.timestamp)),
+                                    onTap = { imagenPantallaCompleta = msg.imageBytes },
+                                )
+                            }
+                            MessageType.AUDIO -> {
+                                val estaReproduciendo = idMensajeReproduciendo == msg.id
+                                AudioBubble(
+                                    isOwn = msg.isOwn,
+                                    isPlaying = estaReproduciendo,
+                                    onPlayPause = {
+                                        msg.audioBytes?.let { bytes ->
+                                            viewModel.toggleReproduccion(msg.id, bytes)
+                                        }
+                                    },
+                                    durationMs = msg.audioDurationMs,
+                                    progressFraction = if (estaReproduciendo) progresoReproduccion else 0f,
+                                    waveform = msg.audioWaveform,
+                                    time = fmt.format(Date(msg.timestamp)),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Barra de entrada: sube con el Column cuando el teclado está abierto ──
             MessageInputBar(
                 text = inputText,
                 onTextChange = viewModel::onInputChange,
@@ -244,85 +333,6 @@ fun ChatScreen(
                 isRecording = estaGrabando,
                 recordingDuration = duracionFormateada,
             )
-        },
-        containerColor = colors.surfaceMuted,
-    ) { innerPadding ->
-        if (messages.isEmpty()) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(innerPadding),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center,
-            ) {
-                Text(
-                    text = "Sé el primero en escribir algo",
-                    style = PrivatiTypography.body,
-                    color = colors.inkMuted,
-                )
-            }
-        } else {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(innerPadding),
-                contentPadding = PaddingValues(
-                    horizontal = PrivatiSpacing.screenHorizontal,
-                    vertical = PrivatiSpacing.md,
-                ),
-                verticalArrangement = Arrangement.spacedBy(PrivatiSpacing.bubbleGap),
-            ) {
-                itemsIndexed(messages, key = { _, msg -> msg.id }) { index, msg ->
-                    // Separador de día: mostrar si es el primer mensaje o cambió el día
-                    val msgAnterior = if (index > 0) messages[index - 1] else null
-                    val cambiodia = msgAnterior == null
-                        || formatearDia(msgAnterior.timestamp) != formatearDia(msg.timestamp)
-                    if (cambiodia) {
-                        DaySeparator(timestamp = msg.timestamp)
-                    }
-
-                    when (msg.type) {
-                        MessageType.SYSTEM -> {
-                            SystemMessage(text = msg.text)
-                        }
-                        MessageType.TEXT -> {
-                            MessageBubble(
-                                text = msg.text,
-                                time = fmt.format(Date(msg.timestamp)),
-                                isOwn = msg.isOwn,
-                                senderName = if (!msg.isOwn) msg.senderName else null,
-                                senderAvatarId = if (!msg.isOwn) msg.senderId else null,
-                            )
-                        }
-                        MessageType.IMAGE -> {
-                            ImageBubble(
-                                isOwn = msg.isOwn,
-                                imageModel = msg.imageBytes,
-                                sizeLabel = msg.imageSizeLabel,
-                                time = fmt.format(Date(msg.timestamp)),
-                                onTap = { imagenPantallaCompleta = msg.imageBytes },
-                            )
-                        }
-                        MessageType.AUDIO -> {
-                            val estaReproduciendo = idMensajeReproduciendo == msg.id
-                            AudioBubble(
-                                isOwn = msg.isOwn,
-                                isPlaying = estaReproduciendo,
-                                onPlayPause = {
-                                    msg.audioBytes?.let { bytes ->
-                                        viewModel.toggleReproduccion(msg.id, bytes)
-                                    }
-                                },
-                                durationMs = msg.audioDurationMs,
-                                progressFraction = if (estaReproduciendo) progresoReproduccion else 0f,
-                                waveform = msg.audioWaveform,
-                                time = fmt.format(Date(msg.timestamp)),
-                            )
-                        }
-                    }
-                }
-            }
         }
     }
 

@@ -39,7 +39,7 @@
         </activity>
 
         <!-- Servicio HCE que responde al AID F0434F52524F31 mientras el host panel está abierto.
-             El sistema Android arranca y para el servicio automáticamente al detectar el lector NFC;
+             El sistema Android arranca y para el servicio automáticamente al detectar el lector NFC
              la app controla qué respuesta enviar a través de CorroHceService.salaActiva. -->
         <service
             android:name=".discovery.nfc.CorroHceService"
@@ -53,7 +53,7 @@
                 android:resource="@xml/apduservice" />
         </service>
 
-        <!-- FileProvider para URIs de fotos capturadas con la cámara (Fase 6) -->
+        <!-- FileProvider para URIs de fotos capturadas con la cámara -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

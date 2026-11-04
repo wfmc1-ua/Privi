@@ -15,6 +15,8 @@ import com.redes.privati.net.Frame
 import com.redes.privati.net.FrameType
 import com.redes.privati.net.HelloBody
 import com.redes.privati.net.AudioBody
+import com.redes.privati.net.ChatCreateBody
+import com.redes.privati.net.ChatInfoBody
 import com.redes.privati.net.ImageBody
 import com.redes.privati.net.JoinLeaveBody
 import com.redes.privati.net.ParticipantInfo
@@ -23,6 +25,7 @@ import com.redes.privati.net.TextBody
 import com.redes.privati.net.WelcomeBody
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -113,6 +116,18 @@ class ChatRepository(private val app: Application) {
     private val _error = MutableSharedFlow<String>(extraBufferCapacity = 1)
     val error: SharedFlow<String> = _error.asSharedFlow()
 
+    /**
+     * Emite el chatId de un grupo recién creado por el usuario local para que la UI
+     * pueda navegar automáticamente a él. Solo se emite cuando el usuario local inició
+     * la creación (host) o cuando el host confirma la creación solicitada (cliente).
+     */
+    private val _nuevoChatId = MutableSharedFlow<String>(extraBufferCapacity = 1)
+    val nuevoChatId: SharedFlow<String> = _nuevoChatId.asSharedFlow()
+
+    /** Solicitudes de entrada pendientes de aprobación (solo host). */
+    private val _pendingRequests = MutableStateFlow<List<PendingRequestInfo>>(emptyList())
+    val pendingRequests: StateFlow<List<PendingRequestInfo>> = _pendingRequests.asStateFlow()
+
     // ──────────────────────────────────────────────────────────────────────────
     // Estado interno de red
     // ──────────────────────────────────────────────────────────────────────────
@@ -125,6 +140,9 @@ class ChatRepository(private val app: Application) {
 
     /** Busca salas Corro por código en la red local (Fase 4). */
     private val nsdBrowser = NsdBrowser(app)
+
+    /** Lista de salas descubiertas por NSD en la red local (Fase 14). */
+    val salasDescubiertas: StateFlow<List<SalaDescubierta>> = nsdBrowser.salas
 
     // ── Modo host ──────────────────────────────────────────────────────────────
     /** Conexiones activas de clientes: remoteId → Connection. */
@@ -140,6 +158,22 @@ class ChatRepository(private val app: Application) {
      */
     private val expulsadosIds: MutableSet<String> =
         Collections.newSetFromMap(ConcurrentHashMap())
+
+    /**
+     * UUIDs de participantes que han sido aceptados en esta sala al menos una vez.
+     * Cuando reconectan con el mismo UUID, se aceptan automáticamente sin pasar por PENDING.
+     * Se limpia al cerrar la sala con [desconectar].
+     */
+    private val acceptedIds: MutableSet<String> =
+        Collections.newSetFromMap(ConcurrentHashMap())
+
+    /** Solicitudes HELLO en espera de aprobación manual del host. */
+    private data class PendingEntry(
+        val info: PendingRequestInfo,
+        val helloBody: com.redes.privati.net.HelloBody,
+        val timerJob: Job,
+    )
+    private val pendingEntries = ConcurrentHashMap<String, PendingEntry>()
 
     /**
      * Grupos activos en la sala: chatId ("grp:<uuid>") → ChatSummary con la lista de miembros.
@@ -173,6 +207,10 @@ class ChatRepository(private val app: Application) {
     @Volatile
     private var codigoSalaCliente: String = ""
 
+    /** Método de conexión original del cliente: "nfc" | "code" | "ip". */
+    @Volatile
+    private var metodoConexionCliente: String = "ip"
+
     /**
      * Par de claves ECDH generado para la sesión actual del cliente (Fase 5).
      * Se crea en [conectarComoCliente] y se consume en [manejarWelcome].
@@ -195,6 +233,12 @@ class ChatRepository(private val app: Application) {
     // API pública
     // ──────────────────────────────────────────────────────────────────────────
 
+    /** Inicia el descubrimiento continuo de salas NSD (Fase 14). */
+    fun iniciarDescubrimiento() = nsdBrowser.iniciarDescubrimiento()
+
+    /** Detiene el descubrimiento continuo de salas NSD (Fase 14). */
+    fun detenerDescubrimiento() = nsdBrowser.detenerDescubrimiento()
+
     fun establecerUsuarioLocal(nombre: String, esHost: Boolean) {
         localUser = Participant(
             id = UUID.randomUUID().toString(),
@@ -213,14 +257,21 @@ class ChatRepository(private val app: Application) {
         modoHost = true
 
         val ip = obtenerIpLocal()
+        val salaName = "Sala de ${usuario.name}"
+        val codigo = generarCodigoSala()
         _roomState.value = RoomState(
             localUserId = usuario.id,
-            roomCode = generarCodigoSala(),
+            roomCode = codigo,
+            roomSecret = UUID.randomUUID().toString().replace("-", "").substring(0, 16),
             hostIp = ip,
             port = puerto,
             participants = listOf(usuario),
             connectionStatus = ConnectionStatus.DISCONNECTED,
+            roomName = salaName,
         )
+        _chats.update { lista ->
+            lista.map { if (it.chatId == "sala") it.copy(nombre = salaName) else it }
+        }
 
         server = ChatServer(puerto, scope) { socket ->
             val remoteId = UUID.randomUUID().toString()
@@ -235,24 +286,26 @@ class ChatRepository(private val app: Application) {
         }
         server!!.start()
 
-        // Anunciar la sala vía NSD para que los clientes la encuentren por código (Fase 4)
-        nsdAdvertiser.start(_roomState.value.roomCode, puerto)
+        nsdAdvertiser.start(codigo, puerto, salaName, usuario.name, 1)
     }
 
     /**
      * Conecta como cliente al servidor en [ip]:[puerto].
-     * Envía HELLO (con [roomCode] si se proporcionó) y espera WELCOME.
+     * Envía HELLO (con [roomCode] si se proporcionó) y espera WELCOME o PENDING.
      * Llamar siempre después de [establecerUsuarioLocal].
      *
-     * @param ip       Dirección IPv4 del servidor.
-     * @param puerto   Puerto TCP del servidor.
-     * @param roomCode Código de sala enviado en HELLO; vacío cuando se conecta por IP manual.
+     * @param ip         Dirección IPv4 del servidor.
+     * @param puerto     Puerto TCP del servidor.
+     * @param roomCode   Código de sala enviado en HELLO; vacío cuando se conecta por IP manual.
+     * @param joinMethod Método de conexión: "nfc" | "code" | "ip" (por defecto "ip").
+     * @param roomSecret Secreto de sala; solo se envía cuando joinMethod="nfc".
      */
-    suspend fun conectarComoCliente(ip: String, puerto: Int, roomCode: String = "") {
+    suspend fun conectarComoCliente(ip: String, puerto: Int, roomCode: String = "", joinMethod: String = "ip", roomSecret: String = "") {
         val usuario = localUser ?: return
         modoHost = false
-        reconexionBloqueada = false // nuevo intento manual: limpiar bloqueo previo
-        codigoSalaCliente = roomCode // persistir para reenviar en reconexión automática
+        reconexionBloqueada = false
+        codigoSalaCliente = roomCode
+        metodoConexionCliente = joinMethod
 
         try {
             val socket = chatClient.conectar(ip, puerto)
@@ -270,15 +323,16 @@ class ChatRepository(private val app: Application) {
                 port = puerto,
                 participants = listOf(usuario),
                 connectionStatus = ConnectionStatus.RECONNECTING,
+                waitingForApproval = false,
             )}
 
-            // Generar par de claves ECDH para esta sesión (Fase 5)
             val handshake = Handshake()
             clienteHandshake = handshake
             val pubKeyB64 = Base64.encodeToString(handshake.publicKeyBytes(), Base64.NO_WRAP)
 
             val cuerpoHello = json.encodeToString(
-                HelloBody(usuario.id, usuario.name, roomCode = roomCode, publicKey = pubKeyB64)
+                HelloBody(usuario.id, usuario.name, roomCode = roomCode, publicKey = pubKeyB64,
+                    joinMethod = joinMethod, roomSecret = roomSecret)
             )
             conn.send(Frame(FrameType.HELLO, cuerpoHello.encodeToByteArray()))
         } catch (e: Exception) {
@@ -300,7 +354,7 @@ class ChatRepository(private val app: Application) {
                 nsdBrowser.buscarSala(codigoSala)
             } ?: throw Exception("No se encontró ninguna sala con el código «$codigoSala» en 15 s")
             val (ip, port) = resultado
-            conectarComoCliente(ip, port, roomCode = codigoSala)
+            conectarComoCliente(ip, port, roomCode = codigoSala, joinMethod = "code")
         } catch (e: Exception) {
             _error.tryEmit(e.message ?: "No se pudo encontrar la sala")
         }
@@ -468,15 +522,18 @@ class ChatRepository(private val app: Application) {
 
     /** Envía BYE, cierra todas las conexiones y limpia el estado. */
     fun desconectar() {
-        reconectando = false // cancelar cualquier bucle de reconexión en curso
+        reconectando = false
         if (modoHost) {
             difundir(Frame(FrameType.BYE, ByteArray(0)))
             clients.values.forEach { it.close() }
             clients.clear()
             clientParticipants.clear()
-            expulsadosIds.clear() // la sala se cierra; la lista negra no persiste
+            expulsadosIds.clear()
+            acceptedIds.clear()
+            pendingEntries.forEach { (_, entry) -> entry.timerJob.cancel() }
+            pendingEntries.clear()
+            _pendingRequests.value = emptyList()
             grupos.clear()
-            // Retirar el anuncio NSD antes de parar el servidor (Fase 4)
             nsdAdvertiser.stop()
             server?.stop()
             server = null
@@ -490,6 +547,115 @@ class ChatRepository(private val app: Application) {
         _chats.value = listOf(ChatSummary(chatId = "sala", tipo = ChatTipo.SALA, nombre = "Chat general"))
         localUser = null
         modoHost = false
+    }
+
+    /**
+     * El host acepta la solicitud de entrada del cliente identificado por [remoteId].
+     * Se envía WELCOME y el cliente pasa a ser un participante activo.
+     */
+    fun aceptarSolicitud(remoteId: String) {
+        if (!modoHost) return
+        val entry = pendingEntries.remove(remoteId) ?: return
+        entry.timerJob.cancel()
+        _pendingRequests.update { it.filter { r -> r.remoteId != remoteId } }
+        procesarAceptacion(remoteId, entry.helloBody)
+    }
+
+    /**
+     * El host rechaza la solicitud de entrada del cliente identificado por [remoteId].
+     * Se envía REJECT y se cierra la conexión.
+     */
+    fun rechazarSolicitud(remoteId: String) {
+        if (!modoHost) return
+        val entry = pendingEntries.remove(remoteId) ?: return
+        entry.timerJob.cancel()
+        _pendingRequests.update { it.filter { r -> r.remoteId != remoteId } }
+        rechazar(remoteId, "El host ha rechazado tu solicitud de entrada")
+    }
+
+    /**
+     * El cliente cancela su solicitud de entrada pendiente.
+     * Envía BYE, cierra la conexión y limpia el estado de espera.
+     */
+    fun cancelarEspera() {
+        connectionCliente?.send(Frame(FrameType.BYE, ByteArray(0)))
+        connectionCliente?.close()
+        connectionCliente = null
+        reconexionBloqueada = true
+        _roomState.update { it.copy(
+            connectionStatus = ConnectionStatus.DISCONNECTED,
+            waitingForApproval = false,
+            isEncrypted = false,
+        )}
+    }
+
+    /**
+     * El host renombra la sala: actualiza el estado local, notifica a los clientes con
+     * CHAT_INFO(chatId="sala") y re-anuncia el servicio NSD con el nuevo nombre.
+     */
+    fun renombrarSala(nuevoNombre: String) {
+        if (!modoHost) return
+        val trimmed = nuevoNombre.trim().ifBlank { return }
+        val usuario = localUser ?: return
+        _roomState.update { it.copy(roomName = trimmed) }
+        _chats.update { lista ->
+            lista.map { if (it.chatId == "sala") it.copy(nombre = trimmed) else it }
+        }
+        agregarMensaje(mensajeSistema("El anfitrión renombró la sala a «$trimmed»"))
+        val infoBody = ChatInfoBody("sala", trimmed, emptyList())
+        difundir(Frame(FrameType.CHAT_INFO, json.encodeToString(infoBody).encodeToByteArray()))
+        nsdAdvertiser.actualizar(trimmed, usuario.name, _roomState.value.participants.size)
+    }
+
+    /**
+     * Crea un nuevo grupo con [nombre] y [memberIds] como miembros adicionales.
+     *
+     * - **Host**: genera el chatId directamente, registra el grupo localmente, envía
+     *   [FrameType.CHAT_INFO] a cada miembro y emite [nuevoChatId] para navegar.
+     * - **Cliente**: envía [FrameType.CHAT_CREATE] al host; cuando el host responde con
+     *   [FrameType.CHAT_INFO] y el creatorId coincide con el usuario local, se emite [nuevoChatId].
+     *
+     * @param nombre    Nombre visible del grupo.
+     * @param memberIds UUIDs de los otros miembros (sin incluir al usuario local).
+     */
+    fun crearGrupo(nombre: String, memberIds: List<String>) {
+        val usuario = localUser ?: return
+        if (modoHost) {
+            val chatId = "grp:${UUID.randomUUID()}"
+            val todosLosMiembros = (memberIds + usuario.id).distinct()
+            registrarGrupoLocal(chatId, nombre, todosLosMiembros, usuario.name)
+
+            val infoBody = ChatInfoBody(chatId, nombre, todosLosMiembros, usuario.id, usuario.name)
+            val tramaChatInfo = Frame(FrameType.CHAT_INFO, json.encodeToString(infoBody).encodeToByteArray())
+            todosLosMiembros.forEach { miembroId ->
+                if (miembroId != usuario.id) {
+                    val destRemoteId = remoteIdDeParticipante(miembroId) ?: return@forEach
+                    clients[destRemoteId]?.send(tramaChatInfo)
+                }
+            }
+            scope.launch { _nuevoChatId.emit(chatId) }
+        } else {
+            val body = ChatCreateBody(nombre, memberIds)
+            val trama = Frame(FrameType.CHAT_CREATE, json.encodeToString(body).encodeToByteArray())
+            connectionCliente?.send(trama)
+        }
+    }
+
+    /**
+     * Asegura que el chat [chatId] existe en [_chats] con nombre visible antes de
+     * que llegue el primer mensaje. Se usa al abrir un privado (dm:) desde Contactos
+     * para que la cabecera de la conversación muestre el nombre, no el chatId crudo.
+     * No hace nada si el chat ya existe.
+     */
+    fun asegurarChat(chatId: String) {
+        if (_chats.value.any { it.chatId == chatId }) return
+        _chats.update { lista ->
+            lista + ChatSummary(
+                chatId = chatId,
+                tipo = tipoDeChatId(chatId),
+                nombre = nombreDeChatId(chatId),
+            )
+        }
     }
 
     /**
@@ -599,12 +765,15 @@ class ChatRepository(private val app: Application) {
             FrameType.HELLO -> if (modoHost) manejarHello(frame, remoteId)
             FrameType.WELCOME -> if (!modoHost) manejarWelcome(frame)
             FrameType.REJECT -> if (!modoHost) manejarReject(frame)
+            FrameType.PENDING -> if (!modoHost) manejarPending()
             FrameType.TEXT -> manejarText(frame, remoteId)
             FrameType.JOIN -> if (!modoHost) manejarJoin(frame)
             FrameType.LEAVE -> if (!modoHost) manejarLeave(frame)
             FrameType.BYE -> manejarBye(remoteId)
             FrameType.IMAGE -> manejarImage(frame, remoteId)
             FrameType.AUDIO -> manejarAudio(frame, remoteId)
+            FrameType.CHAT_CREATE -> if (modoHost) manejarChatCreate(frame, remoteId)
+            FrameType.CHAT_INFO -> if (!modoHost) manejarChatInfo(frame)
             FrameType.PING -> {
                 val pong = Frame(FrameType.PONG, ByteArray(0))
                 if (modoHost) clients[remoteId]?.send(pong) else connectionCliente?.send(pong)
@@ -619,21 +788,20 @@ class ChatRepository(private val app: Application) {
 
     /**
      * El servidor recibe HELLO de un nuevo cliente.
-     * Rechaza si la sala está llena o el nombre ya existe (evita suplantación).
-     * En caso contrario, registra, envía WELCOME con lista completa y avisa con JOIN.
+     *
+     * Flujo (Fase 13):
+     * 1. Rechaza si expulsado, código incorrecto, sala llena o nombre repetido.
+     * 2. Auto-acepta si el UUID ya fue aceptado antes (reconexión) o si viene por NFC con secreto válido.
+     * 3. En cualquier otro caso, pone en PENDING con un temporizador de 60 s.
      */
     private fun manejarHello(frame: Frame, remoteId: String) {
-        val host = localUser ?: return
         try {
             val hello = json.decodeFromString<HelloBody>(frame.body.decodeToString())
 
-            // ── Comprobaciones de rechazo ─────────────────────────────────────
-            // Participante previamente expulsado por el host
             if (expulsadosIds.contains(hello.senderId)) {
                 rechazar(remoteId, "Has sido expulsado de esta sala")
                 return
             }
-            // Código de sala incorrecto (solo se valida si el cliente lo envió; Fase 4+)
             val codigoDeLaSala = _roomState.value.roomCode
             if (hello.roomCode.isNotBlank() &&
                 !hello.roomCode.equals(codigoDeLaSala, ignoreCase = true)
@@ -641,12 +809,11 @@ class ChatRepository(private val app: Application) {
                 rechazar(remoteId, "Código de sala incorrecto")
                 return
             }
-            // Sala llena
-            if (clientParticipants.size >= MAX_CLIENTES) {
+            // Las solicitudes pendientes cuentan para el máximo de la sala
+            if (clientParticipants.size + pendingEntries.size >= MAX_CLIENTES) {
                 rechazar(remoteId, "La sala está llena (máximo $MAX_CLIENTES participantes)")
                 return
             }
-            // Nombre ya en uso: comprobar tanto clientes como el nombre del propio host
             val nombreDelHost = localUser?.name ?: ""
             val nombreRepetido = nombreDelHost.equals(hello.senderName, ignoreCase = true) ||
                 clientParticipants.values.any {
@@ -657,62 +824,122 @@ class ChatRepository(private val app: Application) {
                 return
             }
 
-            // ── Registrar participante ────────────────────────────────────────
-            val nuevoParticipante = Participant(id = hello.senderId, name = hello.senderName)
-            clientParticipants[remoteId] = nuevoParticipante
-            val listaParticipantes = construirListaParticipantes()
-
-            _roomState.update { it.copy(
-                participants = listaParticipantes,
-                connectionStatus = ConnectionStatus.ONLINE,
-            )}
-
-            // ── Handshake ECDH (Fase 5) ───────────────────────────────────────
-            // Si el cliente envió su clave pública, generamos la nuestra, derivamos
-            // la clave de sesión e instalamos el cifrador en la conexión.
-            // Cifrado por salto: cada canal cliente↔host tiene su propia clave;
-            // el host descifra cada trama entrante y la vuelve a cifrar al reenviarla.
-            var hostPublicKeyB64 = ""
-            if (hello.publicKey.isNotBlank()) {
-                try {
-                    val peerKeyBytes = Base64.decode(hello.publicKey, Base64.NO_WRAP)
-                    val handshake = Handshake()
-                    val cipher = handshake.deriveSessionCipher(
-                        peerKeyBytes,
-                        roomCode = hello.roomCode,
-                        isClient = false,  // este extremo es el servidor
-                    )
-                    clients[remoteId]?.cipher = cipher
-                    hostPublicKeyB64 = Base64.encodeToString(handshake.publicKeyBytes(), Base64.NO_WRAP)
-                    _roomState.update { it.copy(isEncrypted = true) }
-                } catch (e: Exception) {
-                    // Clave malformada o ECDH fallido: continuar sin cifrado para esta conexión
-                }
+            // Auto-aceptar: reconexión de un ID ya aprobado
+            if (acceptedIds.contains(hello.senderId)) {
+                procesarAceptacion(remoteId, hello)
+                return
+            }
+            // Auto-aceptar: NFC con secreto válido
+            val secretoActual = _roomState.value.roomSecret
+            if (hello.joinMethod == "nfc" && secretoActual.isNotBlank() && hello.roomSecret == secretoActual) {
+                procesarAceptacion(remoteId, hello)
+                return
             }
 
-            // WELCOME al nuevo cliente con la lista completa y la clave pública del host
-            val infoParticipantes = listaParticipantes.map { p ->
-                ParticipantInfo(p.id, p.name, p.isHost)
+            // Poner en espera: enviar PENDING y arrancar el temporizador de 60 s
+            val timerJob = scope.launch {
+                delay(60_000L)
+                val entry = pendingEntries.remove(remoteId) ?: return@launch
+                entry.timerJob.cancel()
+                _pendingRequests.update { it.filter { r -> r.remoteId != remoteId } }
+                rechazar(remoteId, "La solicitud expiró (60 s sin respuesta del host)")
             }
-            val cuerpoWelcome = json.encodeToString(
-                WelcomeBody(
-                    assignedId = hello.senderId,
-                    hostId = host.id,
-                    hostName = host.name,
-                    participants = infoParticipantes,
-                    publicKey = hostPublicKeyB64,
-                )
+            val info = PendingRequestInfo(
+                remoteId = remoteId,
+                participantId = hello.senderId,
+                participantName = hello.senderName,
+                joinMethod = hello.joinMethod,
+                timestampMs = System.currentTimeMillis(),
             )
-            clients[remoteId]?.send(Frame(FrameType.WELCOME, cuerpoWelcome.encodeToByteArray()))
-
-            // JOIN a los demás clientes (no al recién llegado)
-            val cuerpoJoin = json.encodeToString(JoinLeaveBody(hello.senderId, hello.senderName))
-            difundir(Frame(FrameType.JOIN, cuerpoJoin.encodeToByteArray()), excluirId = remoteId)
-
-            agregarMensaje(mensajeSistema("${hello.senderName} se ha unido"))
+            pendingEntries[remoteId] = PendingEntry(info, hello, timerJob)
+            _pendingRequests.update { it + info }
+            clients[remoteId]?.send(Frame(FrameType.PENDING, ByteArray(0)))
         } catch (e: Exception) {
             rechazar(remoteId, "Formato de identificación incorrecto")
         }
+    }
+
+    /**
+     * Registra al participante, realiza el handshake ECDH, envía WELCOME y notifica con JOIN.
+     * Se llama tanto desde el flujo de auto-aceptación como desde [aceptarSolicitud].
+     */
+    private fun procesarAceptacion(remoteId: String, hello: com.redes.privati.net.HelloBody) {
+        val host = localUser ?: return
+        val ahora = System.currentTimeMillis()
+
+        val nuevoParticipante = Participant(
+            id = hello.senderId,
+            name = hello.senderName,
+            joinMethod = hello.joinMethod,
+            joinedAt = ahora,
+        )
+        clientParticipants[remoteId] = nuevoParticipante
+        acceptedIds.add(hello.senderId)
+
+        val listaParticipantes = construirListaParticipantes()
+        _roomState.update { it.copy(
+            participants = listaParticipantes,
+            connectionStatus = ConnectionStatus.ONLINE,
+        )}
+        reAnunciarNsd()
+
+        var hostPublicKeyB64 = ""
+        if (hello.publicKey.isNotBlank()) {
+            try {
+                val peerKeyBytes = Base64.decode(hello.publicKey, Base64.NO_WRAP)
+                val handshake = Handshake()
+                val cipher = handshake.deriveSessionCipher(
+                    peerKeyBytes,
+                    roomCode = hello.roomCode,
+                    isClient = false,
+                )
+                clients[remoteId]?.cipher = cipher
+                hostPublicKeyB64 = Base64.encodeToString(handshake.publicKeyBytes(), Base64.NO_WRAP)
+                _roomState.update { it.copy(isEncrypted = true) }
+            } catch (_: Exception) {}
+        }
+
+        val gruposDelParticipante = grupos.values
+            .filter { g -> g.miembros.contains(hello.senderId) }
+            .map { g -> ChatInfoBody(g.chatId, g.nombre, g.miembros) }
+        val infoParticipantes = listaParticipantes.map { p ->
+            ParticipantInfo(p.id, p.name, p.isHost, p.joinMethod, p.joinedAt)
+        }
+        val cuerpoWelcome = json.encodeToString(
+            WelcomeBody(
+                assignedId = hello.senderId,
+                hostId = host.id,
+                hostName = host.name,
+                participants = infoParticipantes,
+                publicKey = hostPublicKeyB64,
+                grupos = gruposDelParticipante,
+                roomName = _roomState.value.roomName,
+            )
+        )
+        clients[remoteId]?.send(Frame(FrameType.WELCOME, cuerpoWelcome.encodeToByteArray()))
+
+        val cuerpoJoin = json.encodeToString(JoinLeaveBody(hello.senderId, hello.senderName, hello.joinMethod, ahora))
+        difundir(Frame(FrameType.JOIN, cuerpoJoin.encodeToByteArray()), excluirId = remoteId)
+
+        val etiqueta = etiquetaMetodo(hello.joinMethod)
+        agregarMensaje(mensajeSistema("${hello.senderName} se ha unido$etiqueta"))
+    }
+
+    private fun etiquetaMetodo(joinMethod: String) = when (joinMethod) {
+        "nfc" -> " por NFC"
+        "code" -> " con el código"
+        else -> ""
+    }
+
+    private fun reAnunciarNsd() {
+        if (!modoHost) return
+        val usuario = localUser ?: return
+        val estado = _roomState.value
+        nsdAdvertiser.actualizar(
+            nombreSala = estado.roomName.ifBlank { "Sala de ${usuario.name}" },
+            nombreHost = usuario.name,
+            numConectados = estado.participants.size,
+        )
     }
 
     /** Envía REJECT y cierra la conexión del cliente identificado por [remoteId]. */
@@ -759,6 +986,15 @@ class ChatRepository(private val app: Application) {
 
     /** Desconexión inesperada de un cliente: limpia la sesión y avisa a los demás. */
     private fun manejarDesconexionCliente(remoteId: String) {
+        // Si era una solicitud pendiente, solo limpiar sin avisar con LEAVE
+        val pendingEntry = pendingEntries.remove(remoteId)
+        if (pendingEntry != null) {
+            pendingEntry.timerJob.cancel()
+            clients.remove(remoteId)?.close()
+            _pendingRequests.update { it.filter { r -> r.remoteId != remoteId } }
+            return
+        }
+
         val participant = clientParticipants.remove(remoteId) ?: return
         clients.remove(remoteId)?.close()
 
@@ -766,6 +1002,7 @@ class ChatRepository(private val app: Application) {
         val nuevoEstado = if (listaActualizada.size > 1) ConnectionStatus.ONLINE
                           else ConnectionStatus.DISCONNECTED
         _roomState.update { it.copy(participants = listaActualizada, connectionStatus = nuevoEstado) }
+        reAnunciarNsd()
 
         val cuerpoLeave = json.encodeToString(JoinLeaveBody(participant.id, participant.name))
         difundir(Frame(FrameType.LEAVE, cuerpoLeave.encodeToByteArray()))
@@ -776,13 +1013,18 @@ class ChatRepository(private val app: Application) {
     // Manejadores — Modo cliente
     // ──────────────────────────────────────────────────────────────────────────
 
+    /** El host ha enviado PENDING: la solicitud está en cola, esperar aprobación. */
+    private fun manejarPending() {
+        _roomState.update { it.copy(waitingForApproval = true) }
+    }
+
     private fun manejarWelcome(frame: Frame) {
         val cliente = localUser ?: return
         try {
             val welcome = json.decodeFromString<WelcomeBody>(frame.body.decodeToString())
             val participantes = if (welcome.participants.isNotEmpty()) {
                 welcome.participants.map { info ->
-                    Participant(id = info.id, name = info.name, isHost = info.isHost)
+                    Participant(id = info.id, name = info.name, isHost = info.isHost, joinMethod = info.joinMethod, joinedAt = info.joinedAt)
                 }
             } else {
                 listOf(
@@ -790,8 +1032,24 @@ class ChatRepository(private val app: Application) {
                     cliente,
                 )
             }
-            _roomState.update { it.copy(participants = participantes, connectionStatus = ConnectionStatus.ONLINE) }
-            reconectando = false // reconexión completada con éxito
+            val salaName = welcome.roomName.ifBlank { "" }
+            _roomState.update { it.copy(
+                participants = participantes,
+                connectionStatus = ConnectionStatus.ONLINE,
+                waitingForApproval = false,
+                roomName = salaName,
+            )}
+            if (salaName.isNotBlank()) {
+                _chats.update { lista ->
+                    lista.map { if (it.chatId == "sala") it.copy(nombre = salaName) else it }
+                }
+            }
+            reconectando = false
+
+            // Restaurar los grupos a los que pertenece el cliente (reconexión o primer saludo)
+            welcome.grupos.forEach { grupoInfo ->
+                registrarGrupoLocal(grupoInfo.chatId, grupoInfo.name, grupoInfo.memberIds, "")
+            }
 
             // ── Completar handshake ECDH (Fase 5) ────────────────────────────
             // El host respondió con su clave pública: derivar la clave de sesión
@@ -821,7 +1079,7 @@ class ChatRepository(private val app: Application) {
         }
     }
 
-    /** El servidor rechazó la conexión (sala llena, expulsado, nombre en uso…). */
+    /** El servidor rechazó la conexión (sala llena, expulsado, nombre en uso, timeout…). */
     private fun manejarReject(frame: Frame) {
         try {
             val reject = json.decodeFromString<RejectBody>(frame.body.decodeToString())
@@ -829,21 +1087,25 @@ class ChatRepository(private val app: Application) {
         } catch (_: Exception) {
             _error.tryEmit("Conexión rechazada.")
         }
-        reconexionBloqueada = true  // un rechazo es definitivo; no reintentar aunque caiga el socket
+        reconexionBloqueada = true
         reconectando = false
         connectionCliente?.close()
         connectionCliente = null
-        // La sesión cifrada ya no existe; ocultar el candado hasta la próxima conexión
-        _roomState.update { it.copy(connectionStatus = ConnectionStatus.DISCONNECTED, isEncrypted = false) }
+        _roomState.update { it.copy(connectionStatus = ConnectionStatus.DISCONNECTED, isEncrypted = false, waitingForApproval = false) }
     }
 
     private fun manejarJoin(frame: Frame) {
         try {
             val join = json.decodeFromString<JoinLeaveBody>(frame.body.decodeToString())
-            val nuevo = Participant(id = join.participantId, name = join.participantName)
+            val nuevo = Participant(
+                id = join.participantId,
+                name = join.participantName,
+                joinMethod = join.joinMethod,
+                joinedAt = if (join.joinedAt > 0) join.joinedAt else System.currentTimeMillis(),
+            )
             _roomState.update { it.copy(participants = it.participants + nuevo) }
-            // Los avisos JOIN solo se muestran en el chat sala (spec §4 Chats privados y grupos)
-            agregarMensaje(mensajeSistema("${join.participantName} se ha unido"))
+            val etiqueta = etiquetaMetodo(join.joinMethod)
+            agregarMensaje(mensajeSistema("${join.participantName} se ha unido$etiqueta"))
         } catch (_: Exception) {}
     }
 
@@ -866,6 +1128,8 @@ class ChatRepository(private val app: Application) {
     private fun manejarDesconexionServidor() {
         connectionCliente?.close()
         connectionCliente = null
+        // Si la conexión cae mientras esperamos aprobación, limpiar la bandera
+        _roomState.update { it.copy(waitingForApproval = false) }
         if (!reconectando && !reconexionBloqueada) {
             scope.launch { intentarReconectar() }
         }
@@ -1071,11 +1335,20 @@ class ChatRepository(private val app: Application) {
 
     /**
      * Cierre ordenado (BYE recibido).
-     * - Host: el cliente que envió BYE sale de la sala.
+     * - Host: el cliente que envió BYE sale de la sala (también si era pendiente).
      * - Cliente: el servidor cerró la sala. No reintenta reconexión.
      */
     private fun manejarBye(remoteId: String) {
         if (modoHost) {
+            // Si era una solicitud pendiente, limpiar sin LEAVE
+            val pendingEntry = pendingEntries.remove(remoteId)
+            if (pendingEntry != null) {
+                pendingEntry.timerJob.cancel()
+                clients.remove(remoteId)?.close()
+                _pendingRequests.update { it.filter { r -> r.remoteId != remoteId } }
+                return
+            }
+
             val participant = clientParticipants.remove(remoteId) ?: return
             clients.remove(remoteId)?.close()
 
@@ -1148,7 +1421,8 @@ class ChatRepository(private val app: Application) {
                 val pubKeyB64 = Base64.encodeToString(handshake.publicKeyBytes(), Base64.NO_WRAP)
 
                 val cuerpoHello = json.encodeToString(
-                    HelloBody(usuario.id, usuario.name, roomCode = codigoSalaCliente, publicKey = pubKeyB64)
+                    HelloBody(usuario.id, usuario.name, roomCode = codigoSalaCliente, publicKey = pubKeyB64,
+                        joinMethod = metodoConexionCliente)
                 )
                 conn.send(Frame(FrameType.HELLO, cuerpoHello.encodeToByteArray()))
                 // reconectando se pone a false en manejarWelcome o manejarReject
@@ -1215,6 +1489,85 @@ class ChatRepository(private val app: Application) {
                 }
             }
             else -> android.util.Log.w("Corro", "enrutar: chatId desconocido «$chatId»")
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Gestión de grupos (Fase 12)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * El host recibe CHAT_CREATE de un cliente: valida, genera el chatId y envía
+     * CHAT_INFO a todos los miembros.
+     */
+    private fun manejarChatCreate(frame: Frame, remoteId: String) {
+        try {
+            val createBody = json.decodeFromString<ChatCreateBody>(frame.body.decodeToString())
+            val creador = clientParticipants[remoteId] ?: return
+
+            val todosLosMiembros = (createBody.memberIds + creador.id).distinct()
+            if (todosLosMiembros.size < 3) {
+                android.util.Log.w("Corro", "CHAT_CREATE: se necesitan mínimo 3 miembros")
+                return
+            }
+
+            val chatId = "grp:${UUID.randomUUID()}"
+            registrarGrupoLocal(chatId, createBody.name, todosLosMiembros, creador.name)
+
+            val infoBody = ChatInfoBody(chatId, createBody.name, todosLosMiembros, creador.id, creador.name)
+            val tramaChatInfo = Frame(FrameType.CHAT_INFO, json.encodeToString(infoBody).encodeToByteArray())
+            // Enviar CHAT_INFO a todos los miembros que son clientes (el host ya registró en local)
+            todosLosMiembros.forEach { miembroId ->
+                val destRemoteId = remoteIdDeParticipante(miembroId) ?: return@forEach
+                clients[destRemoteId]?.send(tramaChatInfo)
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("Corro", "Error en CHAT_CREATE: ${e.message}")
+        }
+    }
+
+    /**
+     * El cliente recibe CHAT_INFO del host: registra el grupo localmente.
+     * Si el usuario local es el creador, emite [nuevoChatId] para navegar automáticamente.
+     */
+    private fun manejarChatInfo(frame: Frame) {
+        try {
+            val infoBody = json.decodeFromString<ChatInfoBody>(frame.body.decodeToString())
+            if (infoBody.chatId == "sala") {
+                // Renombrado de sala por el host
+                _roomState.update { it.copy(roomName = infoBody.name) }
+                _chats.update { lista ->
+                    lista.map { if (it.chatId == "sala") it.copy(nombre = infoBody.name) else it }
+                }
+                agregarMensaje(mensajeSistema("El anfitrión renombró la sala a «${infoBody.name}»"))
+                return
+            }
+            registrarGrupoLocal(infoBody.chatId, infoBody.name, infoBody.memberIds, infoBody.creatorName)
+            if (infoBody.creatorId.isNotBlank() && infoBody.creatorId == localUser?.id) {
+                scope.launch { _nuevoChatId.emit(infoBody.chatId) }
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("Corro", "Error en CHAT_INFO: ${e.message}")
+        }
+    }
+
+    /**
+     * Registra el grupo en [grupos] y en [_chats]. Añade el mensaje de sistema
+     * «[creadorNombre] creó el grupo» si [creadorNombre] no está vacío (omitido al reconectar).
+     */
+    private fun registrarGrupoLocal(chatId: String, nombre: String, miembros: List<String>, creadorNombre: String) {
+        val summary = ChatSummary(chatId = chatId, tipo = ChatTipo.GRUPO, nombre = nombre, miembros = miembros)
+        grupos[chatId] = summary
+        _chats.update { lista ->
+            if (lista.any { it.chatId == chatId }) lista else lista + summary
+        }
+        if (creadorNombre.isNotBlank()) {
+            agregarMensaje(Message(
+                type = MessageType.SYSTEM,
+                text = "$creadorNombre creó el grupo",
+                timestamp = System.currentTimeMillis(),
+                chatId = chatId,
+            ))
         }
     }
 

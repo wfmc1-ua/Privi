@@ -98,11 +98,11 @@ class ChatViewModel(
         val texto = inputText.value.trim()
         if (texto.isBlank()) return
         inputText.value = ""
-        repository.enviarTexto(texto)
+        repository.enviarTexto(texto, chatId)
     }
 
     fun enviarImagen(uri: Uri) {
-        viewModelScope.launch { repository.enviarImagen(uri) }
+        viewModelScope.launch { repository.enviarImagen(uri, chatId) }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -150,7 +150,7 @@ class ChatViewModel(
         viewModelScope.launch {
             val grabacion = withContext(Dispatchers.IO) { g.detener() }
             if (grabacion != null) {
-                repository.enviarAudio(grabacion.bytes, grabacion.durationMs, grabacion.waveform)
+                repository.enviarAudio(grabacion.bytes, grabacion.durationMs, grabacion.waveform, chatId)
             }
         }
     }
