@@ -36,7 +36,7 @@ import com.redes.privati.data.Participant
 import com.redes.privati.data.RoomState
 import com.redes.privati.discovery.nfc.CorroHceService
 import com.redes.privati.ui.components.ButtonVariant
-import com.redes.privati.ui.components.ChatRow
+import com.redes.privati.ui.components.ParticipantRow
 import com.redes.privati.ui.components.PrivatiButton
 import com.redes.privati.ui.components.PrivatiTopBar
 import com.redes.privati.ui.icons.PrivatiIcons
@@ -229,7 +229,7 @@ private fun HostPanelContent(
             LazyColumn(modifier = Modifier.weight(1f)) {
                 items(roomState.participants, key = { it.id }) { participant ->
                     val esUsuarioActual = participant.id == roomState.localUserId
-                    ChatRow(
+                    ParticipantRow(
                         participant = participant,
                         isCurrentUser = esUsuarioActual,
                         canKick = !esUsuarioActual && !participant.isHost,

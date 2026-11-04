@@ -10,13 +10,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
+import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
 import com.redes.privati.PrivatiApplication
 import com.redes.privati.data.ConnectionStatus
 import com.redes.privati.ui.screens.chat.ChatScreen
 import com.redes.privati.ui.screens.chat.ChatViewModel
+import com.redes.privati.ui.screens.chats.ChatsScreen
+import com.redes.privati.ui.screens.chats.ChatsViewModel
 import com.redes.privati.ui.screens.host.HostPanelScreen
 import com.redes.privati.ui.screens.host.HostViewModel
 import com.redes.privati.ui.screens.join.JoinScreen
@@ -64,10 +68,10 @@ fun PrivatiNavGraph(
             )
             val roomState by vm.roomState.collectAsState()
 
-            // Navegar al chat cuando el servidor acepte la sesión
+            // Navegar al hub de chats cuando el servidor acepte la sesión
             LaunchedEffect(roomState.connectionStatus) {
                 if (roomState.connectionStatus == ConnectionStatus.ONLINE) {
-                    navController.navigate(Screen.Chat.route) {
+                    navController.navigate(Screen.Chats.route) {
                         // Eliminar JoinScreen del back stack: no tiene sentido volver aquí
                         popUpTo(Screen.Join.route) { inclusive = true }
                     }
@@ -88,10 +92,8 @@ fun PrivatiNavGraph(
             HostPanelScreen(
                 viewModel = vm,
                 onGoToChat = {
-                    navController.navigate(Screen.Chat.route) {
-                        // El host ya no necesita volver al panel durante el chat
-                        popUpTo(Screen.HostPanel.route) { inclusive = true }
-                    }
+                    // El host puede volver al panel con el botón Atrás desde Chats
+                    navController.navigate(Screen.Chats.route)
                 },
                 onCloseRoom = {
                     vm.cerrarSala()
@@ -100,16 +102,48 @@ fun PrivatiNavGraph(
             )
         }
 
-        composable(Screen.Chat.route) {
+        composable(Screen.Chats.route) {
+            val vm: ChatsViewModel = viewModel(
+                factory = ChatsViewModel.Factory(app.chatRepository),
+            )
+            ChatsScreen(
+                viewModel = vm,
+                onOpenChat = { chatId ->
+                    navController.navigate(Screen.Conversation.route(chatId))
+                },
+                onBackToPanel = {
+                    // Solo el host llega aquí; vuelve al panel
+                    navController.popBackStack()
+                },
+                onDisconnect = {
+                    navController.popBackStack(Screen.Welcome.route, inclusive = false)
+                },
+            )
+        }
+
+        composable(
+            route = Screen.Conversation.route,
+            arguments = listOf(
+                navArgument(Screen.Conversation.ARG_CHAT_ID) { type = NavType.StringType },
+            ),
+        ) { backStackEntry ->
+            val chatId = backStackEntry.arguments
+                ?.getString(Screen.Conversation.ARG_CHAT_ID) ?: "sala"
+
+            // Nombre del chat leído del repositorio en tiempo real
+            val chatsActuales by app.chatRepository.chats.collectAsState()
+            val chatNombre = chatsActuales.firstOrNull { it.chatId == chatId }?.nombre
+                ?: if (chatId == "sala") "Chat general" else chatId
+
             val vm: ChatViewModel = viewModel(
-                factory = ChatViewModel.Factory(app.chatRepository),
+                key = "chat_$chatId",
+                factory = ChatViewModel.Factory(app.chatRepository, chatId),
             )
             ChatScreen(
                 viewModel = vm,
-                onBack = {
-                    vm.desconectar()
-                    navController.popBackStack(Screen.Welcome.route, inclusive = false)
-                },
+                chatId = chatId,
+                chatNombre = chatNombre,
+                onBack = { navController.popBackStack() },
             )
         }
     }

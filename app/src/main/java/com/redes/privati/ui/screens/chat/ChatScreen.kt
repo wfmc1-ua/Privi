@@ -22,7 +22,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Scaffold
@@ -50,11 +50,14 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import com.redes.privati.data.MessageType
 import com.redes.privati.ui.components.AudioBubble
+import com.redes.privati.ui.components.DaySeparator
 import com.redes.privati.ui.components.ImageBubble
 import com.redes.privati.ui.components.MessageBubble
 import com.redes.privati.ui.components.MessageInputBar
 import com.redes.privati.ui.components.PrivatiTopBar
 import com.redes.privati.ui.components.StatusPill
+import com.redes.privati.ui.components.SystemMessage
+import com.redes.privati.ui.components.formatearDia
 import com.redes.privati.ui.icons.PrivatiIcons
 import com.redes.privati.ui.theme.PrivatiSpacing
 import com.redes.privati.ui.theme.PrivatiTheme
@@ -64,15 +67,19 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Pantalla de conversación activa.
- * Muestra el hilo de mensajes real desde [ChatViewModel] con la barra de entrada.
+ * Pantalla de conversación activa para el chat identificado por [chatId].
+ * Muestra el hilo de mensajes con separadores de día, avisos de sistema y la barra de entrada.
  *
  * @param viewModel ViewModel que provee mensajes, estado de sala y entrada de texto.
- * @param onBack Navegación de retroceso; quien llame debe llamar a [ChatViewModel.desconectar] antes.
+ * @param chatId Identificador del chat a mostrar (por defecto "sala").
+ * @param chatNombre Nombre visible del chat para la barra superior.
+ * @param onBack Navegación de retroceso (volver a ChatsScreen).
  */
 @Composable
 fun ChatScreen(
     viewModel: ChatViewModel,
+    chatId: String = "sala",
+    chatNombre: String = "Chat general",
     onBack: () -> Unit = {},
 ) {
     val context = LocalContext.current
@@ -150,11 +157,22 @@ fun ChatScreen(
     // Bytes de la imagen seleccionada para la vista a pantalla completa; null = oculto
     var imagenPantallaCompleta by remember { mutableStateOf<ByteArray?>(null) }
 
-    // Nombre del otro participante como título de la barra
-    val tituloChat = roomState.participants
-        .firstOrNull { it.id != roomState.localUserId }
-        ?.name
-        ?: "Chat"
+    // Título: usa el nombre del chat pasado por parámetro
+    val tituloChat = chatNombre.ifBlank {
+        // Fallback: nombre del otro participante (compatibilidad hacia atrás)
+        roomState.participants.firstOrNull { it.id != roomState.localUserId }?.name ?: "Chat"
+    }
+
+    // Subtítulo según tipo de chat (Fase 10: solo sala)
+    val subtituloChat = when {
+        chatId == "sala" -> "${roomState.participants.size} en la sala"
+        chatId.startsWith("dm:") ->
+            if (roomState.connectionStatus == com.redes.privati.data.ConnectionStatus.ONLINE)
+                "En línea" else "Desconectado"
+        chatId.startsWith("grp:") ->
+            "${roomState.participants.size} miembros"
+        else -> "${roomState.participants.size} en la sala"
+    }
 
     // Auto-scroll al último mensaje cuando llega uno nuevo
     LaunchedEffect(messages.size) {
@@ -167,7 +185,7 @@ fun ChatScreen(
         topBar = {
             PrivatiTopBar(
                 title = tituloChat,
-                subtitle = "${roomState.participants.size} en la sala",
+                subtitle = subtituloChat,
                 onNavigateBack = onBack,
                 actions = {
                     Row(
@@ -255,19 +273,18 @@ fun ChatScreen(
                 ),
                 verticalArrangement = Arrangement.spacedBy(PrivatiSpacing.bubbleGap),
             ) {
-                items(messages, key = { it.id }) { msg ->
+                itemsIndexed(messages, key = { _, msg -> msg.id }) { index, msg ->
+                    // Separador de día: mostrar si es el primer mensaje o cambió el día
+                    val msgAnterior = if (index > 0) messages[index - 1] else null
+                    val cambiodia = msgAnterior == null
+                        || formatearDia(msgAnterior.timestamp) != formatearDia(msg.timestamp)
+                    if (cambiodia) {
+                        DaySeparator(timestamp = msg.timestamp)
+                    }
+
                     when (msg.type) {
                         MessageType.SYSTEM -> {
-                            Column(
-                                modifier = Modifier.fillParentMaxWidth(),
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                            ) {
-                                Text(
-                                    text = msg.text,
-                                    style = PrivatiTypography.caption,
-                                    color = colors.inkMuted,
-                                )
-                            }
+                            SystemMessage(text = msg.text)
                         }
                         MessageType.TEXT -> {
                             MessageBubble(

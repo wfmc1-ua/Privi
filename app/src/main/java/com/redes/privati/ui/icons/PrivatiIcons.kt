@@ -20,9 +20,18 @@ import androidx.compose.material.icons.rounded.WifiOff
 import androidx.compose.material.icons.rounded.PersonRemove
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.Notifications
+import androidx.compose.material.icons.rounded.NotificationsOff
+import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.PhotoCamera
 import androidx.compose.material.icons.rounded.PhotoLibrary
+import androidx.compose.material.icons.rounded.PushPin
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.VolumeOff
 
 /**
  * Iconos del sistema de diseño Privati.
@@ -52,4 +61,13 @@ object PrivatiIcons {
     val Reconnect = Icons.Rounded.Refresh
     val Camera = Icons.Rounded.PhotoCamera
     val Gallery = Icons.Rounded.PhotoLibrary
+    val Person = Icons.Rounded.Person
+    val Settings = Icons.Rounded.Settings
+    val Search = Icons.Rounded.Search
+    val Bell = Icons.Rounded.Notifications
+    val BellOff = Icons.Rounded.NotificationsOff
+    val Mute = Icons.Rounded.VolumeOff
+    val Delete = Icons.Rounded.Delete
+    val Pin = Icons.Rounded.PushPin
+    val MoreVert = Icons.Rounded.MoreVert
 }

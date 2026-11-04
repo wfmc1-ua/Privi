@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -33,13 +34,22 @@ import kotlinx.coroutines.withContext
  */
 class ChatViewModel(
     private val repository: ChatRepository,
+    private val chatId: String = "sala",
 ) : ViewModel() {
 
-    val messages: StateFlow<List<Message>> = repository.messages.stateIn(
-        scope = viewModelScope,
-        started = SharingStarted.WhileSubscribed(5_000),
-        initialValue = repository.messages.value,
-    )
+    /** Mensajes del chat identificado por [chatId], filtrados del mapa del repositorio. */
+    val messages: StateFlow<List<Message>> = repository.messages
+        .map { mapa -> mapa.getOrDefault(chatId, emptyList()) }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000),
+            initialValue = repository.messages.value.getOrDefault(chatId, emptyList()),
+        )
+
+    init {
+        // Marcar como leídos los mensajes de este chat al abrir la pantalla
+        repository.marcarLeido(chatId)
+    }
 
     val roomState: StateFlow<RoomState> = repository.roomState.stateIn(
         scope = viewModelScope,
@@ -267,9 +277,10 @@ class ChatViewModel(
 
     class Factory(
         private val repository: ChatRepository,
+        private val chatId: String = "sala",
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T =
-            ChatViewModel(repository) as T
+            ChatViewModel(repository, chatId) as T
     }
 }

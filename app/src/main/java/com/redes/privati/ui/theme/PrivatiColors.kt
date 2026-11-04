@@ -48,6 +48,10 @@ data class PrivatiColors(
     val danger: Color,
     val dangerTint: Color,
     val dangerInk: Color,
+    /** Acción Silenciar al deslizar un chat. */
+    val warning: Color,
+    /** Texto sobre fondo warning. */
+    val warningInk: Color,
     val isDark: Boolean,
 ) {
     companion object {
@@ -80,6 +84,8 @@ internal val PrivatiColorsLight = PrivatiColors(
     danger = Color(0xFFD12F45),
     dangerTint = Color(0xFFFDECEE),
     dangerInk = Color(0xFFB0263A),
+    warning = Color(0xFFF5B04B),
+    warningInk = Color(0xFF1B1B1F),
     isDark = false,
 )
 
@@ -103,6 +109,8 @@ internal val PrivatiColorsDark = PrivatiColors(
     danger = Color(0xFFD12F45),
     dangerTint = Color(0xFF3A1A20),
     dangerInk = Color(0xFFFF8A98),
+    warning = Color(0xFFF5B04B),
+    warningInk = Color(0xFF1B1B1F),
     isDark = true,
 )
 

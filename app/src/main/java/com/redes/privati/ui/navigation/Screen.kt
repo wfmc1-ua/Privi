@@ -14,6 +14,12 @@ sealed class Screen(val route: String) {
     /** Panel del host: código de sala, participantes y gestión de la sesión. */
     object HostPanel : Screen("host_panel")
 
-    /** Hilo de conversación activo. */
-    object Chat : Screen("chat")
+    /** Hub principal de la sala: lista de chats, contactos y ajustes. */
+    object Chats : Screen("chats")
+
+    /** Hilo de conversación para el chat identificado por chatId. */
+    object Conversation : Screen("conversation/{chatId}") {
+        fun route(chatId: String) = "conversation/$chatId"
+        const val ARG_CHAT_ID = "chatId"
+    }
 }

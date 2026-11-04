@@ -37,6 +37,7 @@ data class Participant(
  * @param audioWaveform ~30 amplitudes normalizadas [0f, 1f] para visualizar la onda.
  * @param timestamp Hora de envío en milisegundos desde epoch.
  * @param isOwn Si es verdadero, este dispositivo lo envió.
+ * @param chatId Chat al que pertenece este mensaje ("sala", "dm:<a>:<b>", "grp:<uuid>").
  */
 data class Message(
     val id: String = UUID.randomUUID().toString(),
@@ -51,6 +52,7 @@ data class Message(
     val audioWaveform: List<Float> = emptyList(),
     val timestamp: Long = System.currentTimeMillis(),
     val isOwn: Boolean = false,
+    val chatId: String = "sala",
 ) {
     // ByteArrays rompen equals/hashCode automáticos; se excluyen de la comparación.
     override fun equals(other: Any?): Boolean {

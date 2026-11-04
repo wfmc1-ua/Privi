@@ -132,6 +132,7 @@ data class RejectBody(val reason: String)
  * @param senderName Nombre visible del emisor.
  * @param text Contenido del mensaje.
  * @param timestamp Marca de tiempo en milisegundos desde epoch.
+ * @param chatId Identificador del chat destino ("sala", "dm:<a>:<b>", "grp:<uuid>").
  */
 @Serializable
 data class TextBody(
@@ -140,6 +141,7 @@ data class TextBody(
     val senderName: String,
     val text: String,
     val timestamp: Long,
+    val chatId: String = "sala",
 )
 
 /** Cuerpo de JOIN/LEAVE: aviso de entrada o salida de un participante. */
@@ -162,6 +164,7 @@ data class JoinLeaveBody(
  * @param senderName Nombre visible del emisor.
  * @param timestamp Marca de tiempo en ms desde epoch.
  * @param sizeBytes Tamaño del bloque JPEG en bytes.
+ * @param chatId    Identificador del chat destino ("sala", "dm:<a>:<b>", "grp:<uuid>").
  */
 @Serializable
 data class ImageBody(
@@ -170,6 +173,7 @@ data class ImageBody(
     val senderName: String,
     val timestamp: Long,
     val sizeBytes: Int,
+    val chatId: String = "sala",
 )
 
 /**
@@ -187,6 +191,7 @@ data class ImageBody(
  * @param durationMs Duración de la nota en milisegundos.
  * @param sizeBytes  Tamaño del bloque AAC en bytes.
  * @param waveform   ~30 amplitudes normalizadas [0f, 1f] calculadas con getMaxAmplitude() durante la grabación.
+ * @param chatId     Identificador del chat destino ("sala", "dm:<a>:<b>", "grp:<uuid>").
  */
 @Serializable
 data class AudioBody(
@@ -197,4 +202,5 @@ data class AudioBody(
     val durationMs: Long,
     val sizeBytes: Int,
     val waveform: List<Float> = emptyList(),
+    val chatId: String = "sala",
 )

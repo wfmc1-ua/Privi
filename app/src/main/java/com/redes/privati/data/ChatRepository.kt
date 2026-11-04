@@ -50,19 +50,27 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * Coordina la capa de red ([ChatServer], [ChatClient], [Connection]) con la UI
  * mediante [StateFlow]. Gestiona el protocolo de sala multi-cliente: handshake
- * HELLO/WELCOME, relay de mensajes, avisos JOIN/LEAVE, rechazo y expulsión.
+ * HELLO/WELCOME, enrutado de mensajes por chatId, avisos JOIN/LEAVE, rechazo y expulsión.
  *
  * ## Modos de operación
  * - **Host (servidor)**: acepta múltiples clientes (máx. [MAX_CLIENTES]).
- *   En `manejarHello` rechaza sala llena y nombres repetidos. Relay por salto:
- *   cuando recibe TEXT de un cliente lo reenvía a todos los demás.
+ *   En `manejarHello` rechaza sala llena y nombres repetidos. Enrutado inteligente
+ *   según [chatId]: sala → todos, dm: → solo el otro, grp: → miembros del grupo.
  * - **Cliente**: una sola [connectionCliente] hacia el servidor.
  *   Si la conexión se pierde inesperadamente, intenta reconectar con backoff
  *   exponencial hasta [MAX_INTENTOS_RECONEXION] veces.
  *
+ * ## Modelo multichat (Fase 9)
+ * Los mensajes se almacenan en [messages] como mapa chatId → lista. El chat "sala"
+ * siempre existe. Los dm/grp se añadirán en Fases 11 y 12. El host enruta con
+ * [enrutar] validando que el senderId coincide con la conexión que envía y que el
+ * emisor es miembro del chat destino.
+ *
  * ## Protocolo de cifrado (Fase 5)
- * En la Fase 5 se añadirá ECDH + AES-GCM justo antes de [Connection.send] y
- * tras recibir en [procesarTrama].
+ * Cifrado por salto: cada canal cliente↔host tiene su propia clave ECDH+AES-GCM.
+ * El host descifra cada trama entrante y la vuelve a cifrar al reenviarla.
+ * Limitación aceptada: el host puede leer los privados y grupos; el cifrado E2E entre
+ * clientes queda fuera de alcance y está documentado aquí.
  */
 class ChatRepository(private val app: Application) {
 
@@ -81,8 +89,23 @@ class ChatRepository(private val app: Application) {
     // Estado observable por la UI
     // ──────────────────────────────────────────────────────────────────────────
 
-    private val _messages = MutableStateFlow<List<Message>>(emptyList())
-    val messages: StateFlow<List<Message>> = _messages.asStateFlow()
+    /**
+     * Mensajes agrupados por chatId. La clave "sala" siempre existe.
+     * Los chats dm: y grp: se crearán en Fases 11 y 12.
+     */
+    private val _messages = MutableStateFlow<Map<String, List<Message>>>(
+        mapOf("sala" to emptyList())
+    )
+    val messages: StateFlow<Map<String, List<Message>>> = _messages.asStateFlow()
+
+    /**
+     * Resúmenes de chats para la lista de Chats (Fase 10).
+     * En Fase 9 siempre contiene solo el chat "sala".
+     */
+    private val _chats = MutableStateFlow<List<ChatSummary>>(
+        listOf(ChatSummary(chatId = "sala", tipo = ChatTipo.SALA, nombre = "Chat general"))
+    )
+    val chats: StateFlow<List<ChatSummary>> = _chats.asStateFlow()
 
     private val _roomState = MutableStateFlow(RoomState())
     val roomState: StateFlow<RoomState> = _roomState.asStateFlow()
@@ -117,6 +140,12 @@ class ChatRepository(private val app: Application) {
      */
     private val expulsadosIds: MutableSet<String> =
         Collections.newSetFromMap(ConcurrentHashMap())
+
+    /**
+     * Grupos activos en la sala: chatId ("grp:<uuid>") → ChatSummary con la lista de miembros.
+     * Se llena en Fase 12 (CHAT_CREATE/CHAT_INFO). En Fase 9 permanece vacío.
+     */
+    private val grupos = ConcurrentHashMap<String, ChatSummary>()
 
     private var server: ChatServer? = null
 
@@ -278,7 +307,7 @@ class ChatRepository(private val app: Application) {
     }
 
     /**
-     * Selecciona, comprime y envía una imagen.
+     * Selecciona, comprime y envía una imagen al chat [chatId].
      *
      * El bitmap se reescala a 1280 px en el lado largo (si es necesario) y se
      * comprime a JPEG calidad 80 en [Dispatchers.Default] antes de enviar.
@@ -286,11 +315,11 @@ class ChatRepository(private val app: Application) {
      * ```
      * [4B longitud de cabecera BE][bytes JSON][bytes JPEG]
      * ```
-     * El cifrado AES-GCM se aplica automáticamente en la capa [Connection].
      *
-     * @param uri URI de la imagen seleccionada con [ActivityResultContracts.PickVisualMedia].
+     * @param uri    URI de la imagen seleccionada con [ActivityResultContracts.PickVisualMedia].
+     * @param chatId Chat destino (por defecto "sala").
      */
-    suspend fun enviarImagen(uri: Uri) {
+    suspend fun enviarImagen(uri: Uri, chatId: String = "sala") {
         val usuario = localUser ?: return
 
         val jpegBytes = withContext(Dispatchers.Default) {
@@ -339,21 +368,22 @@ class ChatRepository(private val app: Application) {
         val timestamp = System.currentTimeMillis()
         val etiqueta = "${jpegBytes.size / 1024} KB · por red local"
 
-        _messages.update { lista ->
-            lista + Message(
-                id = id,
-                senderId = usuario.id,
-                senderName = usuario.name,
-                type = MessageType.IMAGE,
-                imageBytes = jpegBytes,
-                imageSizeLabel = etiqueta,
-                timestamp = timestamp,
-                isOwn = true,
-            )
-        }
+        agregarMensaje(Message(
+            id = id,
+            senderId = usuario.id,
+            senderName = usuario.name,
+            type = MessageType.IMAGE,
+            imageBytes = jpegBytes,
+            imageSizeLabel = etiqueta,
+            timestamp = timestamp,
+            isOwn = true,
+            chatId = chatId,
+        ))
 
         // Serializar cuerpo: [4B longitud cabecera BE][bytes JSON cabecera][bytes JPEG]
-        val cabeceraJson = json.encodeToString(ImageBody(id, usuario.id, usuario.name, timestamp, jpegBytes.size))
+        val cabeceraJson = json.encodeToString(
+            ImageBody(id, usuario.id, usuario.name, timestamp, jpegBytes.size, chatId = chatId)
+        )
         val cabeceraBytes = cabeceraJson.encodeToByteArray()
         val cuerpo = ByteBuffer.allocate(4 + cabeceraBytes.size + jpegBytes.size)
             .putInt(cabeceraBytes.size)
@@ -362,31 +392,37 @@ class ChatRepository(private val app: Application) {
             .array()
 
         val trama = Frame(FrameType.IMAGE, cuerpo)
-        if (modoHost) difundir(trama) else connectionCliente?.send(trama)
+        if (modoHost) enrutar(trama, chatId, usuario.id) else connectionCliente?.send(trama)
     }
 
-    /** Envía texto: pinta localmente + relay a clientes (host) o envía al servidor (cliente). */
-    fun enviarTexto(texto: String) {
+    /**
+     * Envía texto al chat [chatId]: pinta localmente + relay a clientes (host) o envía al servidor (cliente).
+     *
+     * @param texto  Contenido del mensaje.
+     * @param chatId Chat destino (por defecto "sala").
+     */
+    fun enviarTexto(texto: String, chatId: String = "sala") {
         val usuario = localUser ?: return
 
         val id = UUID.randomUUID().toString()
         val timestamp = System.currentTimeMillis()
 
-        _messages.update { lista ->
-            lista + Message(
-                id = id,
-                senderId = usuario.id,
-                senderName = usuario.name,
-                text = texto,
-                timestamp = timestamp,
-                isOwn = true,
-            )
-        }
+        agregarMensaje(Message(
+            id = id,
+            senderId = usuario.id,
+            senderName = usuario.name,
+            text = texto,
+            timestamp = timestamp,
+            isOwn = true,
+            chatId = chatId,
+        ))
 
-        val cuerpo = json.encodeToString(TextBody(id, usuario.id, usuario.name, texto, timestamp))
+        val cuerpo = json.encodeToString(
+            TextBody(id, usuario.id, usuario.name, texto, timestamp, chatId = chatId)
+        )
         val frame = Frame(FrameType.TEXT, cuerpo.encodeToByteArray())
 
-        if (modoHost) difundir(frame) else connectionCliente?.send(frame)
+        if (modoHost) enrutar(frame, chatId, usuario.id) else connectionCliente?.send(frame)
     }
 
     /**
@@ -427,7 +463,7 @@ class ChatRepository(private val app: Application) {
 
         val cuerpoLeave = json.encodeToString(JoinLeaveBody(participant.id, participant.name))
         difundir(Frame(FrameType.LEAVE, cuerpoLeave.encodeToByteArray()))
-        _messages.update { it + mensajeSistema("${participant.name} ha sido expulsado") }
+        agregarMensaje(mensajeSistema("${participant.name} ha sido expulsado"))
     }
 
     /** Envía BYE, cierra todas las conexiones y limpia el estado. */
@@ -439,6 +475,7 @@ class ChatRepository(private val app: Application) {
             clients.clear()
             clientParticipants.clear()
             expulsadosIds.clear() // la sala se cierra; la lista negra no persiste
+            grupos.clear()
             // Retirar el anuncio NSD antes de parar el servidor (Fase 4)
             nsdAdvertiser.stop()
             server?.stop()
@@ -449,9 +486,108 @@ class ChatRepository(private val app: Application) {
             connectionCliente = null
         }
         _roomState.value = RoomState()
-        _messages.value = emptyList()
+        _messages.value = mapOf("sala" to emptyList())
+        _chats.value = listOf(ChatSummary(chatId = "sala", tipo = ChatTipo.SALA, nombre = "Chat general"))
         localUser = null
         modoHost = false
+    }
+
+    /**
+     * Marca todos los mensajes de [chatId] como leídos (noLeidos = 0).
+     * Llamar al abrir la pantalla de conversación de ese chat.
+     */
+    fun marcarLeido(chatId: String) {
+        _chats.update { lista ->
+            lista.map { if (it.chatId == chatId) it.copy(noLeidos = 0) else it }
+        }
+    }
+
+    /**
+     * Silencia o activa las notificaciones del chat [chatId] (solo local).
+     * Cuando está silenciado, los mensajes nuevos no incrementan la insignia.
+     */
+    fun silenciarChat(chatId: String, silenciado: Boolean) {
+        _chats.update { lista ->
+            lista.map { if (it.chatId == chatId) it.copy(silenciado = silenciado) else it }
+        }
+    }
+
+    /**
+     * Fija o desfija el chat [chatId] al principio de la lista (solo local).
+     */
+    fun fijarChat(chatId: String, fijado: Boolean) {
+        _chats.update { lista ->
+            lista.map { if (it.chatId == chatId) it.copy(fijado = fijado) else it }
+        }
+    }
+
+    /**
+     * Elimina el historial local del chat [chatId] y lo oculta de la lista.
+     * No tiene efecto sobre el chat «sala» (nunca se elimina).
+     * El chat reaparece automáticamente cuando llega un mensaje nuevo.
+     */
+    fun eliminarChatLocal(chatId: String) {
+        if (chatId == "sala") return // sala no se puede eliminar
+        _messages.update { mapa -> mapa - chatId }
+        _chats.update { lista -> lista.filter { it.chatId != chatId } }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Gestión de mensajes por chat
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Añade [mensaje] al mapa de mensajes del chat correspondiente y actualiza
+     * el resumen del chat. Los mensajes de sistema no suman en no-leídos.
+     */
+    private fun agregarMensaje(mensaje: Message) {
+        val chatId = mensaje.chatId
+        _messages.update { mapa ->
+            val lista = mapa.getOrDefault(chatId, emptyList())
+            mapa + (chatId to lista + mensaje)
+        }
+        // Los mensajes de sistema no actualizan la vista previa ni los no-leídos
+        if (mensaje.type != MessageType.SYSTEM) {
+            actualizarResumenChat(chatId, mensaje)
+        }
+    }
+
+    /**
+     * Actualiza o crea el [ChatSummary] del chat [chatId] con el último mensaje.
+     * Incrementa [ChatSummary.noLeidos] salvo que el mensaje sea propio ([Message.isOwn]).
+     */
+    private fun actualizarResumenChat(chatId: String, mensaje: Message) {
+        val preview = when (mensaje.type) {
+            MessageType.TEXT  -> mensaje.text
+            MessageType.IMAGE -> "[imagen]"
+            MessageType.AUDIO -> "[nota de voz]"
+            MessageType.SYSTEM -> ""
+        }
+        _chats.update { lista ->
+            val existe = lista.any { it.chatId == chatId }
+            if (existe) {
+                lista.map { resumen ->
+                    if (resumen.chatId == chatId) {
+                        resumen.copy(
+                            ultimoMensaje = preview,
+                            ultimaHora = mensaje.timestamp,
+                            noLeidos = if (!mensaje.isOwn && !resumen.silenciado)
+                                resumen.noLeidos + 1 else resumen.noLeidos,
+                        )
+                    } else resumen
+                }
+            } else {
+                // Chat nuevo (dm o grp que aparece por primera vez en Fases 11-12)
+                lista + ChatSummary(
+                    chatId = chatId,
+                    tipo = tipoDeChatId(chatId),
+                    nombre = nombreDeChatId(chatId),
+                    ultimoMensaje = preview,
+                    ultimaHora = mensaje.timestamp,
+                    noLeidos = if (!mensaje.isOwn) 1 else 0,
+                )
+            }
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -573,7 +709,7 @@ class ChatRepository(private val app: Application) {
             val cuerpoJoin = json.encodeToString(JoinLeaveBody(hello.senderId, hello.senderName))
             difundir(Frame(FrameType.JOIN, cuerpoJoin.encodeToByteArray()), excluirId = remoteId)
 
-            _messages.update { it + mensajeSistema("${hello.senderName} se ha unido") }
+            agregarMensaje(mensajeSistema("${hello.senderName} se ha unido"))
         } catch (e: Exception) {
             rechazar(remoteId, "Formato de identificación incorrecto")
         }
@@ -587,21 +723,37 @@ class ChatRepository(private val app: Application) {
         clientParticipants.remove(remoteId)
     }
 
-    /** El servidor recibe TEXT de un cliente: lo añade al hilo y lo reenvía (relay). */
+    /**
+     * El servidor recibe TEXT de un cliente.
+     * Valida que el senderId coincida con la conexión que envía (evita suplantación).
+     * Valida que el emisor sea miembro del chatId. Si pasa, añade al hilo y enruta.
+     */
     private fun manejarTextHost(frame: Frame, remoteId: String) {
         try {
             val textBody = json.decodeFromString<TextBody>(frame.body.decodeToString())
-            _messages.update { lista ->
-                lista + Message(
-                    id = textBody.id,
-                    senderId = textBody.senderId,
-                    senderName = textBody.senderName,
-                    text = textBody.text,
-                    timestamp = textBody.timestamp,
-                    isOwn = false,
-                )
+
+            // Validar que el senderId coincide con el participante de esta conexión
+            val participante = clientParticipants[remoteId] ?: return
+            if (textBody.senderId != participante.id) {
+                android.util.Log.w("Corro", "TEXT: senderId no coincide con remoteId $remoteId")
+                return
             }
-            difundir(frame, excluirId = remoteId)
+            // Validar membresía del chat
+            if (!esMiembroDelChat(textBody.chatId, participante.id)) {
+                android.util.Log.w("Corro", "TEXT: ${participante.name} no es miembro de ${textBody.chatId}")
+                return
+            }
+
+            agregarMensaje(Message(
+                id = textBody.id,
+                senderId = textBody.senderId,
+                senderName = textBody.senderName,
+                text = textBody.text,
+                timestamp = textBody.timestamp,
+                isOwn = false,
+                chatId = textBody.chatId,
+            ))
+            enrutar(frame, textBody.chatId, textBody.senderId)
         } catch (_: Exception) {}
     }
 
@@ -617,7 +769,7 @@ class ChatRepository(private val app: Application) {
 
         val cuerpoLeave = json.encodeToString(JoinLeaveBody(participant.id, participant.name))
         difundir(Frame(FrameType.LEAVE, cuerpoLeave.encodeToByteArray()))
-        _messages.update { it + mensajeSistema("${participant.name} se ha desconectado") }
+        agregarMensaje(mensajeSistema("${participant.name} se ha desconectado"))
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -690,7 +842,8 @@ class ChatRepository(private val app: Application) {
             val join = json.decodeFromString<JoinLeaveBody>(frame.body.decodeToString())
             val nuevo = Participant(id = join.participantId, name = join.participantName)
             _roomState.update { it.copy(participants = it.participants + nuevo) }
-            _messages.update { it + mensajeSistema("${join.participantName} se ha unido") }
+            // Los avisos JOIN solo se muestran en el chat sala (spec §4 Chats privados y grupos)
+            agregarMensaje(mensajeSistema("${join.participantName} se ha unido"))
         } catch (_: Exception) {}
     }
 
@@ -700,7 +853,8 @@ class ChatRepository(private val app: Application) {
             _roomState.update { it.copy(
                 participants = it.participants.filter { p -> p.id != leave.participantId },
             )}
-            _messages.update { it + mensajeSistema("${leave.participantName} ha salido") }
+            // Los avisos LEAVE solo se muestran en el chat sala
+            agregarMensaje(mensajeSistema("${leave.participantName} ha salido"))
         } catch (_: Exception) {}
     }
 
@@ -728,16 +882,15 @@ class ChatRepository(private val app: Application) {
     private fun manejarTextCliente(frame: Frame) {
         try {
             val textBody = json.decodeFromString<TextBody>(frame.body.decodeToString())
-            _messages.update { lista ->
-                lista + Message(
-                    id = textBody.id,
-                    senderId = textBody.senderId,
-                    senderName = textBody.senderName,
-                    text = textBody.text,
-                    timestamp = textBody.timestamp,
-                    isOwn = false,
-                )
-            }
+            agregarMensaje(Message(
+                id = textBody.id,
+                senderId = textBody.senderId,
+                senderName = textBody.senderName,
+                text = textBody.text,
+                timestamp = textBody.timestamp,
+                isOwn = false,
+                chatId = textBody.chatId,
+            ))
         } catch (_: Exception) {}
     }
 
@@ -746,34 +899,35 @@ class ChatRepository(private val app: Application) {
     // ──────────────────────────────────────────────────────────────────────────
 
     /**
-     * Añade la nota de voz al hilo local y la envía como trama AUDIO.
+     * Añade la nota de voz al hilo local del chat [chatId] y la envía como trama AUDIO.
      * El cuerpo de la trama tiene el formato:
      * ```
      * [4B longitud cabecera BE][bytes JSON][bytes AAC-MPEG4]
      * ```
+     *
+     * @param chatId Chat destino (por defecto "sala").
      */
-    fun enviarAudio(bytes: ByteArray, durationMs: Long, waveform: List<Float>) {
+    fun enviarAudio(bytes: ByteArray, durationMs: Long, waveform: List<Float>, chatId: String = "sala") {
         val usuario = localUser ?: return
 
         val id = UUID.randomUUID().toString()
         val timestamp = System.currentTimeMillis()
 
-        _messages.update { lista ->
-            lista + Message(
-                id = id,
-                senderId = usuario.id,
-                senderName = usuario.name,
-                type = MessageType.AUDIO,
-                audioBytes = bytes,
-                audioDurationMs = durationMs,
-                audioWaveform = waveform,
-                timestamp = timestamp,
-                isOwn = true,
-            )
-        }
+        agregarMensaje(Message(
+            id = id,
+            senderId = usuario.id,
+            senderName = usuario.name,
+            type = MessageType.AUDIO,
+            audioBytes = bytes,
+            audioDurationMs = durationMs,
+            audioWaveform = waveform,
+            timestamp = timestamp,
+            isOwn = true,
+            chatId = chatId,
+        ))
 
         val cabeceraJson = json.encodeToString(
-            AudioBody(id, usuario.id, usuario.name, timestamp, durationMs, bytes.size, waveform)
+            AudioBody(id, usuario.id, usuario.name, timestamp, durationMs, bytes.size, waveform, chatId = chatId)
         )
         val cabeceraBytes = cabeceraJson.encodeToByteArray()
         val cuerpo = ByteBuffer.allocate(4 + cabeceraBytes.size + bytes.size)
@@ -783,7 +937,7 @@ class ChatRepository(private val app: Application) {
             .array()
 
         val trama = Frame(FrameType.AUDIO, cuerpo)
-        if (modoHost) difundir(trama) else connectionCliente?.send(trama)
+        if (modoHost) enrutar(trama, chatId, usuario.id) else connectionCliente?.send(trama)
     }
 
     /**
@@ -806,28 +960,42 @@ class ChatRepository(private val app: Application) {
         }
     }
 
-    /** El cliente recibe AUDIO del servidor: añade la nota al hilo. */
+    /** El cliente recibe AUDIO del servidor: añade la nota al hilo del chat correspondiente. */
     private fun manejarAudioCliente(frame: Frame) {
         val (cabecera, aacBytes) = parsearTramaAudio(frame) ?: return
-        _messages.update { lista ->
-            lista + Message(
-                id = cabecera.id,
-                senderId = cabecera.senderId,
-                senderName = cabecera.senderName,
-                type = MessageType.AUDIO,
-                audioBytes = aacBytes,
-                audioDurationMs = cabecera.durationMs,
-                audioWaveform = cabecera.waveform,
-                timestamp = cabecera.timestamp,
-                isOwn = false,
-            )
-        }
+        agregarMensaje(Message(
+            id = cabecera.id,
+            senderId = cabecera.senderId,
+            senderName = cabecera.senderName,
+            type = MessageType.AUDIO,
+            audioBytes = aacBytes,
+            audioDurationMs = cabecera.durationMs,
+            audioWaveform = cabecera.waveform,
+            timestamp = cabecera.timestamp,
+            isOwn = false,
+            chatId = cabecera.chatId,
+        ))
     }
 
-    /** El servidor recibe AUDIO de un cliente: lo añade al hilo y hace relay. */
+    /**
+     * El servidor recibe AUDIO de un cliente.
+     * Valida senderId y membresía antes de añadir al hilo y enrutar.
+     */
     private fun manejarAudioHost(frame: Frame, remoteId: String) {
-        manejarAudioCliente(frame)
-        difundir(frame, excluirId = remoteId)
+        val (cabecera, _) = parsearTramaAudio(frame) ?: return
+
+        val participante = clientParticipants[remoteId] ?: return
+        if (cabecera.senderId != participante.id) {
+            android.util.Log.w("Corro", "AUDIO: senderId no coincide con remoteId $remoteId")
+            return
+        }
+        if (!esMiembroDelChat(cabecera.chatId, participante.id)) {
+            android.util.Log.w("Corro", "AUDIO: ${participante.name} no es miembro de ${cabecera.chatId}")
+            return
+        }
+
+        manejarAudioCliente(frame) // añadir localmente (el host también lo ve)
+        enrutar(frame, cabecera.chatId, cabecera.senderId)
     }
 
     private fun manejarAudio(frame: Frame, remoteId: String) {
@@ -862,31 +1030,43 @@ class ChatRepository(private val app: Application) {
         }
     }
 
-    /** El cliente recibe IMAGE del servidor: añade el mensaje al hilo. */
+    /** El cliente recibe IMAGE del servidor: añade el mensaje al hilo del chat correspondiente. */
     private fun manejarImageCliente(frame: Frame) {
         val (cabecera, jpegBytes, etiqueta) = parsearTramImagen(frame) ?: return
-        _messages.update { lista ->
-            lista + Message(
-                id = cabecera.id,
-                senderId = cabecera.senderId,
-                senderName = cabecera.senderName,
-                type = MessageType.IMAGE,
-                imageBytes = jpegBytes,
-                imageSizeLabel = etiqueta,
-                timestamp = cabecera.timestamp,
-                isOwn = false,
-            )
-        }
+        agregarMensaje(Message(
+            id = cabecera.id,
+            senderId = cabecera.senderId,
+            senderName = cabecera.senderName,
+            type = MessageType.IMAGE,
+            imageBytes = jpegBytes,
+            imageSizeLabel = etiqueta,
+            timestamp = cabecera.timestamp,
+            isOwn = false,
+            chatId = cabecera.chatId,
+        ))
     }
 
     /**
-     * El servidor recibe IMAGE de un cliente: lo añade al hilo y lo reenvía (relay).
+     * El servidor recibe IMAGE de un cliente.
+     * Valida senderId y membresía antes de añadir al hilo y enrutar.
      * El descifrado ya ocurrió en [Connection]; el re-cifrado por salto ocurre en
-     * [difundir] al pasar por el cifrador de cada conexión de destino.
+     * [enrutar] al pasar por el cifrador de cada conexión de destino.
      */
     private fun manejarImageHost(frame: Frame, remoteId: String) {
-        manejarImageCliente(frame)
-        difundir(frame, excluirId = remoteId)
+        val (cabecera, _, _) = parsearTramImagen(frame) ?: return
+
+        val participante = clientParticipants[remoteId] ?: return
+        if (cabecera.senderId != participante.id) {
+            android.util.Log.w("Corro", "IMAGE: senderId no coincide con remoteId $remoteId")
+            return
+        }
+        if (!esMiembroDelChat(cabecera.chatId, participante.id)) {
+            android.util.Log.w("Corro", "IMAGE: ${participante.name} no es miembro de ${cabecera.chatId}")
+            return
+        }
+
+        manejarImageCliente(frame) // añadir localmente
+        enrutar(frame, cabecera.chatId, cabecera.senderId)
     }
 
     /**
@@ -906,14 +1086,14 @@ class ChatRepository(private val app: Application) {
 
             val cuerpoLeave = json.encodeToString(JoinLeaveBody(participant.id, participant.name))
             difundir(Frame(FrameType.LEAVE, cuerpoLeave.encodeToByteArray()))
-            _messages.update { it + mensajeSistema("${participant.name} ha salido") }
+            agregarMensaje(mensajeSistema("${participant.name} ha salido"))
         } else {
             // BYE ordenado: no intentar reconectar
             connectionCliente?.close()
             connectionCliente = null
             // La sesión cifrada se cerró ordenadamente; quitar el candado
             _roomState.update { it.copy(connectionStatus = ConnectionStatus.DISCONNECTED, isEncrypted = false) }
-            _messages.update { it + mensajeSistema("El servidor cerró la sala") }
+            agregarMensaje(mensajeSistema("El servidor cerró la sala"))
         }
     }
 
@@ -940,7 +1120,7 @@ class ChatRepository(private val app: Application) {
         reconectando = true
         // La sesión cifrada se perdió con el socket; el candado vuelve tras el nuevo WELCOME
         _roomState.update { it.copy(connectionStatus = ConnectionStatus.RECONNECTING, isEncrypted = false) }
-        _messages.update { it + mensajeSistema("Conexión perdida. Reconectando…") }
+        agregarMensaje(mensajeSistema("Conexión perdida. Reconectando…"))
 
         for (intento in 1..MAX_INTENTOS_RECONEXION) {
             if (!reconectando) return // el usuario llamó desconectar()
@@ -987,12 +1167,92 @@ class ChatRepository(private val app: Application) {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // Utilidades internas
+    // Enrutado en el host (Fase 9)
     // ──────────────────────────────────────────────────────────────────────────
 
+    /**
+     * Enruta [frame] al/los destinatarios correctos según [chatId].
+     * Solo se usa en modo host para tramas TEXT/IMAGE/AUDIO.
+     *
+     * - "sala"  → todos los clientes conectados menos el emisor.
+     * - "dm:*"  → solo al otro participante del par privado.
+     * - "grp:*" → a los miembros del grupo menos el emisor (Fase 12).
+     *
+     * Si un destinatario es el host, ya recibió el mensaje localmente en el
+     * manejador correspondiente; aquí solo se envía a los clientes (via socket).
+     * Si un destinatario está desconectado, el mensaje se descarta sin almacenar.
+     *
+     * @param frame     Trama a reenviar (ya incluye chatId en el cuerpo).
+     * @param chatId    Identificador del chat destino extraído del cuerpo.
+     * @param emisorId  participantId del emisor para excluirle del envío.
+     */
+    private fun enrutar(frame: Frame, chatId: String, emisorId: String) {
+        // remoteId del emisor: null si el emisor es el host (no tiene socket)
+        val emisorRemoteId = remoteIdDeParticipante(emisorId)
+
+        when {
+            chatId == "sala" -> {
+                // Chat general: a todos los clientes menos al emisor
+                difundir(frame, excluirId = emisorRemoteId)
+            }
+            chatId.startsWith("dm:") -> {
+                // Privado: extraer el id del otro participante del par
+                val partes = chatId.removePrefix("dm:").split(":")
+                if (partes.size != 2) return
+                val destinatarioId = partes.firstOrNull { it != emisorId } ?: return
+                val destinatarioRemoteId = remoteIdDeParticipante(destinatarioId) ?: return
+                // Si el destinatario es el host ya recibió en local; aquí solo va a clientes
+                clients[destinatarioRemoteId]?.send(frame)
+            }
+            chatId.startsWith("grp:") -> {
+                // Grupo: enviar a los miembros conectados menos al emisor (Fase 12)
+                val grupo = grupos[chatId] ?: return
+                grupo.miembros.forEach { miembroId ->
+                    if (miembroId != emisorId) {
+                        val destRemoteId = remoteIdDeParticipante(miembroId) ?: return@forEach
+                        clients[destRemoteId]?.send(frame)
+                    }
+                }
+            }
+            else -> android.util.Log.w("Corro", "enrutar: chatId desconocido «$chatId»")
+        }
+    }
+
+    /**
+     * Envía [frame] a todos los clientes conectados, excepto al identificado por [excluirId].
+     * Se usa para tramas de control (JOIN, LEAVE, BYE) y como parte de [enrutar] para "sala".
+     */
     private fun difundir(frame: Frame, excluirId: String? = null) {
         clients.forEach { (id, conn) -> if (id != excluirId) conn.send(frame) }
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Utilidades internas
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Verifica si [participantId] tiene derecho a enviar/recibir en [chatId].
+     * - sala → todos los participantes son miembros.
+     * - dm:* → el participante debe estar en el par de ids del chatId.
+     * - grp:* → el participante debe estar en [grupos][chatId].miembros.
+     */
+    private fun esMiembroDelChat(chatId: String, participantId: String): Boolean {
+        return when {
+            chatId == "sala" -> true
+            chatId.startsWith("dm:") -> {
+                val partes = chatId.removePrefix("dm:").split(":")
+                partes.size == 2 && participantId in partes
+            }
+            chatId.startsWith("grp:") -> {
+                grupos[chatId]?.miembros?.contains(participantId) == true
+            }
+            else -> false
+        }
+    }
+
+    /** Busca el remoteId (clave de socket) de un participante dado su participantId. */
+    private fun remoteIdDeParticipante(participantId: String): String? =
+        clientParticipants.entries.firstOrNull { it.value.id == participantId }?.key
 
     private fun construirListaParticipantes(): List<Participant> {
         val lista = mutableListOf<Participant>()
@@ -1021,12 +1281,35 @@ class ChatRepository(private val app: Application) {
         return (1..4).map { chars.random() }.joinToString("")
     }
 
-    private fun nombreDelOtroParticipante(): String? =
-        _roomState.value.participants.firstOrNull { it.id != localUser?.id }?.name
+    /** Infiere el [ChatTipo] a partir del prefijo del [chatId]. */
+    private fun tipoDeChatId(chatId: String) = when {
+        chatId == "sala"              -> ChatTipo.SALA
+        chatId.startsWith("dm:")  -> ChatTipo.PRIVADO
+        chatId.startsWith("grp:") -> ChatTipo.GRUPO
+        else                          -> ChatTipo.SALA
+    }
 
+    /**
+     * Infiere el nombre visible de un chat a partir de su [chatId].
+     * Para dm: busca el nombre del otro participante en la lista actual.
+     * Para grp: usa el nombre almacenado en [grupos].
+     */
+    private fun nombreDeChatId(chatId: String): String = when {
+        chatId == "sala" -> "Chat general"
+        chatId.startsWith("dm:") -> {
+            val partes = chatId.removePrefix("dm:").split(":")
+            val otroId = partes.firstOrNull { it != localUser?.id } ?: chatId
+            _roomState.value.participants.firstOrNull { it.id == otroId }?.name ?: chatId
+        }
+        chatId.startsWith("grp:") -> grupos[chatId]?.nombre ?: "Grupo"
+        else -> chatId
+    }
+
+    /** Crea un mensaje de sistema para el chat sala con la [hora] actual. */
     private fun mensajeSistema(texto: String) = Message(
         type = MessageType.SYSTEM,
         text = texto,
         timestamp = System.currentTimeMillis(),
+        chatId = "sala",
     )
 }
